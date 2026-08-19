@@ -1,6 +1,6 @@
 # DeepSeek V4 Flash adaptation plan
 
-> **TL;DR:** DeepSeek V4 Flash has a local 155.4 GiB checkpoint and a conservative single-B300 correctness path: EP1 eager execution with an explicit masked FP8xFP4 MoE chain, a test-only bounded BF16 expert diagnostic, model-owned 128-token compressed-KV pages, and slot-local mutable state; G0-G3 stay greedy before G4 adds the two official temperature/top-p profiles, while prefix cache/offload/P-D/DSpark and fused MegaMoE remain deferred. Full residency, raw weight-layout compatibility, new V4F kernel instances, and reproducible accuracy fixtures remain evidence gates, not assumptions.
+> **TL;DR:** DSV4F G0 is green on the local 155.4 GiB checkpoint: the CPU-only crate cross-validates both configs and exactly validates 67,612 target plus 4,705 explicit DSpark-skip tensor headers, producing a complete shard/shape/dtype/scale/action ledger without starting CUDA. G1 must now prove single-B300 streaming residency; raw quantized-layout compatibility, V4F kernel instances, and reproducible accuracy fixtures remain evidence gates.
 >
 > **Last touched:** 2026-08
 
@@ -25,6 +25,10 @@
   3. Add `docs/models/dsv4f/adaptation-plan.md` to the models section of `docs/index.md` with a scanning-friendly TL;DR.
   4. Verify the resulting branch, diff, Markdown structure, local checkpoint byte count, and every source path cited by the document; record the commands and results in the execution log.
   5. Complete the debrief with the branch/doc outcome, verification limitations, and the first evidence-gathering follow-up.
+  6. Implement G0 as a CPU-only model crate with root/inference config cross-validation and no CUDA initialization.
+  7. Generate target and DSpark tensor contracts from the pinned architecture, then validate index/header name, dtype, shape, shard, and byte coverage.
+  8. Add a standalone G0 CLI, focused unit tests, workspace/server feature wiring, and run the validator against the local 48-shard checkpoint.
+  9. Record exact verification results and remaining toolchain limitations before the G0 code commit.
 - **Risks / open questions**:
   - The local checkpoint is about 155.4 GiB, but disk size does not prove single-B300 residency because load-time expansion, device repacking, workspace, CUDA Graph, and KV budgets remain unmeasured.
   - The official examples use four ranks; EP1 support for all 256 experts and its kernel contract remain unverified.
@@ -309,7 +313,7 @@ No policy choice remains that must be settled before implementation begins. The 
 
 ### Weight loading and residency
 
-- Exact safetensor names, shapes, storage dtypes, scale association, and per-layer byte totals need a generated manifest ledger.
+- G0 now generates and validates the exact safetensor names, shapes, storage dtypes, scale associations, shards, source bytes, and destination/load actions. The local replay covered all 72,317 tensors and emitted a 29,212,800-byte JSON ledger.
 - FP4 expert payload compatibility with the in-tree DeepGEMM SM100 layout is unproven; K3's byte-isomorphism result cannot be assumed for V4F.
 - Dense FP8 and UE8M0 scale layouts need direct probes before selecting raw upload versus repack.
 - Peak host and device memory during mmap, staging, scale preparation, and graph construction must be measured.
@@ -380,6 +384,8 @@ When this phase starts, implement the bounded checkpoint mechanism in `pegainfer
 ## Implementation gates
 
 ### G0: Manifest and config
+
+**Result (2026-08-19): green for the CPU-only G0 contract.** The local 48-shard checkpoint passes exact config, index, header, dtype, shape, byte, scale-partner, and target/skip coverage. The standalone gate does not initialize CUDA. The model-line source and server feature/hint are wired; compiling the complete frontend dependency graph remains an environment verification item because this login node lacks the repository development image's OpenSSL headers and `pkg-config`.
 
 - Parse root `config.json` as the runtime contract and require a separately parsed `inference/config.json` for M1 cross-validation.
 - Normalize and compare every target-path field used by execution; allow only the explicit one-versus-three-layer DSpark mismatch and fail closed on all other differences.
@@ -585,23 +591,57 @@ After G4, run version-pinned vLLM and SGLang on matched prompts and sampling set
 - Deferred minimum useful throughput and optimization targets until the correct G0-G4 path provides a baseline.
 - Result: all policy choices required before implementation are closed; remaining open items are evidence gates or implementation details.
 
+### Step 21: G0 contract derivation
+
+- Re-read the repository documentation index, this adaptation record, the shared logits-gate policy, K3/GLM5.2 manifest patterns, model-line dispatch, and the development-container instructions.
+- Normalized all 72,317 local safetensor headers into 101 name/dtype/shape families without reading tensor payloads.
+- Derived the exact generated coverage: 67,612 target tensors and 4,705 explicit DSpark skip tensors, including stage counts 1,568 / 1,565 / 1,572.
+- Fixed the conservative G0 load classification: unquantized and FP8 payloads direct-upload, routed FP4 payloads direct-to-final expert banks, FP8/FP4 scales bounded-repack, and every generated `mtp.*` contract skip-only.
+- Result: success; the derived set matched every real header with zero missing, unknown, dtype, or shape differences.
+
+### Step 22: G0 implementation
+
+- Added the CPU-only `pegainfer-dsv4f` crate and `dsv4f-g0` binary; its default build has no CUDA, core, kernel, or frontend dependency.
+- Implemented root `config.json` plus mandatory `inference/config.json` validation. Every target-path value is either cross-checked or pinned, and only root-next-n `1` versus inference-MTP `3` is accepted as an explicit exception.
+- Generated the target and DSpark namespaces from architecture facts rather than checkpoint enumeration. Unknown names, missing target/skip names, duplicate names, index/header shard disagreement, dtype/shape/byte drift, and unsupported architecture or quantization variants fail closed.
+- Added scale partners and a complete load classification. The local result contains 1,199 direct uploads, 33,024 direct-to-expert-bank payloads, 365 bounded FP8-scale repacks, 33,024 bounded FP4-scale repacks, and 4,705 DSpark skips.
+- Added the workspace/server `dsv4f` feature, model detection and feature hint. G0 launch validates the checkpoint then explicitly refuses serving until G1-G4 rather than returning a fake engine.
+- Result: success.
+
+### Step 23: G0 verification
+
+- Installed the repository-pinned `nightly-2026-07-10` with rustfmt/clippy under `~/.rustup` and `~/.cargo`. The login image has no system `cc`, so release linking used Zig 0.15.2 from `~/.local/share/zig-0.15.2`, exposed as `~/.local/bin/zig` plus a real `zig cc -target x86_64-linux-gnu` wrapper at `~/.local/bin/zig-cc`; `~/.local/bin/cc` points to that wrapper so ordinary Cargo commands work without per-command linker overrides. This produced one linker-only warning about a deprecated optimization spelling. No compiler or linker toolchain is installed under `/tmp`.
+- Compiled and ran a standalone Rust smoke binary with `rustc -C linker=~/.local/bin/zig-cc`; it printed `home toolchain ok` and produced a GNU/Linux ELF. Zig retained its linker cache under the normal user-home cache, and the ignored `target/` smoke inputs/output were removed afterward.
+- `cargo fmt --all -- --check`: pass.
+- `cargo clippy --release -p pegainfer-dsv4f --all-targets -- -D warnings`: pass.
+- `cargo test --release -p pegainfer-dsv4f`: 12 passed, 0 failed. Coverage includes the sole config exception, cross-source drift, foreign architecture, quantization drift, missing inference config, exact counts/bytes/actions, complete DSpark stages, unknown/missing names, dtype/shape/byte failures, FP4 bank placement, and symmetric scale partners.
+- Ran the release `dsv4f-g0` against `/home/lcpu/models/deepseek-ai/DeepSeek-V4-Flash-0731`: 48 shards, 67,612 target tensors / 156,015,698,140 bytes, 4,705 DSpark skips / 10,862,838,300 bytes, and 166,878,536,440 total payload bytes passed. The complete reproducible ledger is local at `/tmp/dsv4f-g0-ledger.json` and all scale-partner links are symmetric.
+- `cargo metadata --no-deps --format-version 1 --quiet`: pass; the new crate is a workspace member and the server feature resolves to the optional model dependency.
+- A complete `server` feature check reached existing frontend native dependencies, then stopped because this stripped login environment has no OpenSSL development headers or `pkg-config`. The repository development container specifies both, but Docker is unavailable on this node; no server-build pass is claimed here.
+- Result: G0 core gate green; full frontend/server compilation remains an environment follow-up, not a checkpoint-contract failure.
+
 ### Unexpected
 
 - The checkpoint's safetensor file total is 7,998,896 bytes larger than the manifest payload. This is expected container/header overhead; use manifest payload for tensor accounting and file total for storage accounting.
 - The HF and inference configs disagree on the auxiliary layer count (1 versus 3), while the manifest contains three complete `mtp.*` stages. M1 now skips that namespace explicitly; later DSpark support must reconcile the contract rather than silently normalize it.
-- Cargo is absent from the current login environment, so no Rust build or test was claimed for this documentation-only task.
+- The login environment initially had no Rust or system C toolchain. Rust was installed under the user home as requested; a user-local Zig linker was sufficient for the pure G0 crate, while the optional frontend graph additionally requires the repository development image's OpenSSL/pkg-config packages.
+- A final no-override `cargo test` rebuild initially failed with `linker cc not found`: installing `zig-cc` alone did not satisfy Cargo's default linker name. Adding the user-local `~/.local/bin/cc -> zig-cc` link fixed the real rebuild; all 12 release tests and strict clippy then passed again.
+- The generated `/tmp/dsv4f-g0-ledger.json` is a disposable validation artifact, not a toolchain component; rerunning `dsv4f-g0 --output` can place it at any retained artifact path.
 
 ## Debrief
 
-- **Outcome**: The DSV4F work now has a dedicated branch and one indexed living document recording the local source snapshot, confirmed architecture/KV decisions, conservative M1 scope, open evidence gates, and phased gates.
+- **Outcome**: The branch now contains a CPU-only DSV4F G0 crate, strict dual-config validator, complete generated tensor contract and ledger CLI, workspace/server feature wiring, 12 passing release tests, and a green replay over all 48 local checkpoint shards without CUDA initialization.
 - **Pitfalls encountered**:
   - Disk checkpoint size is useful evidence but cannot be presented as a GPU-fit result.
   - A 128-token boundary does not eliminate ratio-4 overlap or sliding-window state, so it cannot justify prefix reuse by itself.
 - **Lessons learned**:
   - V4F should follow the repository's hybrid-state pattern: shared logical pages, model-owned physical storage, and explicit bounded-state lifecycle.
   - Accuracy work must begin at stateful operator boundaries before a full logits gate can diagnose failures effectively.
+  - Generating names from the architecture and comparing both directions catches missing tensors and newly introduced namespaces; enumerating the checkpoint itself would make those negative controls impossible.
+  - Header-only mmap validation is sufficient for G0 and completes quickly without faulting 166 GB of payload into memory.
 - **Follow-ups**:
-  - Next action is G0: generate the complete tensor/scale/layout ledger and a peak-residency plan for a no-duplicate single-B300 loader.
+  - Next action is G1: consume the G0 ledger in a no-duplicate streaming loader, implement the bounded scale repacks, and measure final/peak single-B300 residency before allocating runtime state.
+  - Run the `dsv4f` server feature check in `docker/Dockerfile.dev` (or an equivalent host with OpenSSL development headers and `pkg-config`) before treating the model-line wiring as build-verified.
   - Generate and hash the official MP1 reference checkpoint before producing the primary oracle fixtures; keep it outside the repository and outside PegaInfer's runtime contract.
   - After G0, run G1 as a load-only executable before implementing the complete forward path.
   - After M1, add whole-prompt or chunked prefill and gate its terminal state and logits against token-by-token prefill.
