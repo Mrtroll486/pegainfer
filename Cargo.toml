@@ -10,6 +10,7 @@ members = [
   "pegainfer-bench",
   "pegainfer-build",
   "pegainfer-deepseek-v2-lite",
+  "pegainfer-dsv4f",
   "pegainfer-gemma4",
   "pegainfer-glm52",
   "pegainfer-k3",
@@ -119,6 +120,7 @@ pegainfer-build = { path = "pegainfer-build" }
 pegainfer-core = { path = "pegainfer-core" }
 pegainfer-cupti = { path = "pegainfer-cupti" }
 pegainfer-deepseek-v2-lite = { path = "pegainfer-deepseek-v2-lite" }
+pegainfer-dsv4f = { path = "pegainfer-dsv4f" }
 pegainfer-frontend = { path = "pegainfer-frontend" }
 pegainfer-gemma4 = { path = "pegainfer-gemma4" }
 pegainfer-glm52 = { path = "pegainfer-glm52" }

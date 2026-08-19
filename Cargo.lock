@@ -3579,6 +3579,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pegainfer-dsv4f"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "memmap2",
+ "pegainfer-frontend",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "pegainfer-frontend"
 version = "0.1.0"
 dependencies = [
