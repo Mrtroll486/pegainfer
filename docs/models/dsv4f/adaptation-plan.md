@@ -29,6 +29,8 @@
   7. Generate target and DSpark tensor contracts from the pinned architecture, then validate index/header name, dtype, shape, shard, and byte coverage.
   8. Add a standalone G0 CLI, focused unit tests, workspace/server feature wiring, and run the validator against the local 48-shard checkpoint.
   9. Record exact verification results and remaining toolchain limitations before the G0 code commit.
+  10. Push the signed G0 series to `origin/feat/dsv4-flash`, review this living document against the implementation, and correct stale or ambiguous gate wording.
+  11. Split G1-G4 into ordered, reviewable commits that preserve crate ownership and put reference-only golden artifacts before the PegaInfer implementation that consumes them.
 - **Risks / open questions**:
   - The local checkpoint is about 155.4 GiB, but disk size does not prove single-B300 residency because load-time expansion, device repacking, workspace, CUDA Graph, and KV budgets remain unmeasured.
   - The official examples use four ranks; EP1 support for all 256 experts and its kernel contract remain unverified.
@@ -396,10 +398,11 @@ When this phase starts, implement the bounded checkpoint mechanism in `pegainfer
 
 ### G1: Single-B300 load
 
+- Add an opt-in GPU/runtime feature without pulling CUDA into the default CPU-only G0 validator.
 - Stream the complete raw 43-layer HF checkpoint into final EP1 allocations without host/device full-copy duplication.
 - Confirm that no `mtp.*` tensor is uploaded and report its skipped source bytes separately from target-model residency.
-- Record total resident weights, transformation workspace, fixed runtime allocations, and remaining memory.
-- Prove from measured bytes that one slot supports the fixed 512-token development profile and leaves enough headroom for the separately scheduled 4,096-token correctness profile; block G1 if either allocation contract cannot be met.
+- Measure free memory before load, after final weights with transient repack workspace released, and after allocating the real fake-quant KV slab, one mutable slot, and fixed operator scratch.
+- Allocate both the 512-token development shape and the separately scheduled 4,096-token correctness shape in load-only runs; do not infer either fit from checkpoint bytes alone. Block G1 if either concrete allocation contract fails.
 
 ### G2: Operator oracles
 
@@ -425,6 +428,7 @@ When this phase starts, implement the bounded checkpoint mechanism in `pegainfer
 
 ### G4: Lifecycle and serving
 
+- Extend `ServePlan` with a model-scoped route capability: DSV4F selects completions-only while the default for existing model lines remains unchanged; gate explicit chat rejection at the frontend boundary.
 - Prove reset and slot reuse after success, pre-execution rejection, and a client abort whose launched GPU work drains successfully.
 - Classify CUDA/kernel/synchronization, unexpected OOM, non-finite output, and post-launch state-invariant failures as fatal scheduler errors; fail all open requests and execute no later FIFO entry.
 - Add full-lifetime KV admission and impossible-request rejection.
@@ -443,6 +447,62 @@ DSpark work must reconcile the HF one-layer declaration with the three `mtp.*` s
 The fused MegaMoE follow-up must implement V4F's clamped SwiGLU semantics rather than inheriting K3's `situ` spelling. Its acceptance gate is same-route comparison against the retained masked chain at W13-equivalent output, post-activation, expert output, weighted combine, and full-model logits. Only after those gates pass should throughput determine whether it becomes the default path.
 
 After G4, run version-pinned vLLM and SGLang on matched prompts and sampling settings. Compare teacher-forced logits where exposed, greedy output with near-tie attribution, cache-boundary behavior, and serving resource use. These results qualify interoperability and production behavior; they do not retroactively redefine the primary oracle.
+
+## Planned commit map
+
+The IDs below are ordering labels, not a claim that one gate equals one commit. Every row must build and pass its focused release checks before the next row begins, every commit carries a DCO sign-off, and a gate's documentation commit records only commands and evidence actually produced. If one row grows beyond a reviewable unit it may split further; rows must not be merged across ownership boundaries merely to reduce the commit count.
+
+Reference-only fixture commits deliberately precede the PegaInfer code that consumes them. They contain the frozen input/provenance manifest and generated reference artifacts, but no candidate-dependent probe selection. Cross-cutting kernel and frontend changes remain isolated from model scheduler changes so they can be reviewed and reverted independently.
+
+### G1 commit series: raw load and measured residency
+
+| ID | Proposed commit | Owned scope and exit condition |
+| --- | --- | --- |
+| G1.1 | `feat(dsv4f): add GPU load plan and runtime feature` | Add optional CUDA/core/kernel dependencies, typed final allocation plans derived from the G0 ledger, and load-plan unit tests. The default G0 build remains CPU-only; no payload upload yet. |
+| G1.2 | `feat(dsv4f): stream raw tensors into EP1 allocations` | Add shard-at-a-time mmap, bounded pinned staging, event-guarded source lifetimes, direct uploads, explicit DSpark skips, and synthetic-shard failure tests. Repack-required entries remain fail-closed. |
+| G1.3 | `feat(dsv4f): resolve quantized checkpoint layouts` | Add V4F-gated load-time layout probes/repack kernels and wire FP8/FP4 payload plus scale actions into their final allocations. Record byte-isomorphic families and reject every unresolved layout. No forward kernels. |
+| G1.4 | `feat(dsv4f): allocate M1 KV and mutable state` | Add the model-owned 128-token fake-quant KV slab, one slot's window/compressor/indexer state, fixed scratch, and `pegainfer-kv-store` ownership for the 512 and 4,096 profiles. No operator execution. |
+| G1.5 | `test(dsv4f): gate single-b300 load residency` | Add the load-only B300 gate and report pre-load, post-weight, transient peak, post-state, and remaining bytes; assert no DSpark upload or duplicate resident checkpoint and require both context profiles to allocate. |
+| G1.6 | `docs(dsv4f): record G1 residency evidence` | Record exact B300, driver/toolchain, source hashes, layout decisions, byte accounting, peak measurements, and GO/NO-GO. Advance to G2 only on GO. |
+
+### G2 commit series: oracle-gated operators
+
+| ID | Proposed commit | Owned scope and exit condition |
+| --- | --- | --- |
+| G2.1 | `test(dsv4f): pin primary oracle harness and inputs` | Add the bundled-reference generator, fixture schema, converter/runtime provenance, frozen seeds/tokens/positions, artifact hashing, and reference-only negative-control machinery. The derived MP1 checkpoint and full dumps stay out of Git. |
+| G2.2 | `test(dsv4f): add dense and hyper-connection goldens` | Commit reference-only probes for embeddings/norms, Q/KV projections, RoPE/inverse-RoPE, Hyper-Connection pre/post mixing, Sinkhorn, and model bookends before their PegaInfer comparison code. |
+| G2.3 | `feat(dsv4f): add dense and hyper-connection operators` | Implement and gate the G2.2 family, including complete-tensor B300 comparisons and retained compact probes. Do not compose a decoder layer yet. |
+| G2.4 | `test(dsv4f): add compressor and window goldens` | Commit reference-only ratio-4/ratio-128 compressor, FP32 gate/score, fake-FP8 KV, and 3/4/5 plus 127/128/129 boundary artifacts. |
+| G2.5 | `feat(dsv4f): add compressor and window transitions` | Implement the single-token window/compressor state transition, reset/replay tests, fake-quant BF16 cache writes, and negative controls against G2.4. |
+| G2.6 | `test(dsv4f): add indexer and sparse-attention goldens` | Commit reference-only query rotation, Hadamard/fake-FP4, score reduction, top-k/tie, selected-position union, and sparse-attention outputs. |
+| G2.7 | `feat(dsv4f): add indexer and sparse attention` | Implement and gate the G2.6 family, including top-512 selection semantics and window/compressed-position union. No full decoder layer. |
+| G2.8 | `test(dsv4f): add routed-expert goldens` | Commit reference-only hash/score routing, top-6 IDs/weights, shared expert, W13, clamped SwiGLU, requant, W2, and weighted-combine taps. |
+| G2.9 | `feat(dsv4f): add bounded BF16 expert diagnostics` | Add the test-only one-expert dequant/GEMM scaffold and use G2.8 to isolate payload, scale, orientation, activation, routing, and combine semantics. It remains unavailable to serving. |
+| G2.10 | `feat(dsv4f): add native FP8xFP4 masked MoE chain` | Add the SM100 W13/W2 instances and explicit masked chain, wire raw/repacked expert banks, and pass every G2.8 boundary plus complete-output comparison. BF16 success cannot waive this gate. |
+| G2.11 | `docs(dsv4f): record G2 operator evidence` | Record reference provenance, full-artifact hashes, selected compact probes, calibrated numerical floors, negative-control results, and every reuse/new-kernel decision. |
+
+### G3 commit series: layer and full-model correctness
+
+| ID | Proposed commit | Owned scope and exit condition |
+| --- | --- | --- |
+| G3.1 | `test(dsv4f): add layer and logits reference fixtures` | Before layer/model implementation, commit reference-only representative-layer taps, short teacher-forced top-64 logits, boundary sequences, and compact 4,096-token state/logit probes with full-artifact hashes. |
+| G3.2 | `feat(dsv4f): compose eager decoder layers` | Compose and gate hash-routed, ratio-4, ratio-128, and final decoder layers from G2 operators. Keep DSpark state and auxiliary hidden taps absent. |
+| G3.3 | `feat(dsv4f): add full-model single-token forward` | Add embeddings, 43-layer eager execution, final norm/lm head, and one absolute-position state transition reused by prefill and decode. Expose logits/diagnostic taps, not serving. |
+| G3.4 | `test(dsv4f): add teacher-forced logits gate` | Replay fixed feeds against G3.1, calibrate regret/mean/p99 on the common top-8 head, retain top-64 attribution, and add fault-injection negative controls. |
+| G3.5 | `test(dsv4f): gate 4096-token state continuity` | Add the manual B300 profile for real top-512 truncation, 32 ratio-128 groups, multi-page continuity, and final state/logit probes; keep complete dumps local and hashed. |
+| G3.6 | `docs(dsv4f): record G3 model-forward evidence` | Record fixture sizes/hashes, calibrated tolerances, short/long outcomes, runtime/memory observations, and the exact greedy correctness claim. |
+
+### G4 commit series: scheduler and completions serving
+
+| ID | Proposed commit | Owned scope and exit condition |
+| --- | --- | --- |
+| G4.1 | `feat(frontend): add model-scoped route capabilities` | Extend `ServePlan` and route construction with a completions-only capability, explicit chat rejection, and regression tests proving existing model lines retain their current routes. No DSV4F scheduler code. |
+| G4.2 | `feat(dsv4f): add single-slot executor and KV admission` | Wrap the G3 token step in one GPU slot, add full-lifetime KV entitlement, 512/default and 4,096/test admission profiles, impossible-request rejection, and complete slot reset primitives. |
+| G4.3 | `feat(dsv4f): add bounded FIFO scheduler` | Add one active request plus eight waiters, cancellation/queue-full behavior, waiting-depth metrics, recoverable cleanup ordering, and fail-stop propagation for uncertain GPU mutation. |
+| G4.4 | `feat(dsv4f): serve greedy completions` | Replace the G0 launch refusal with the executor/scheduler engine, connect model-scoped completions-only serving, and run token-by-token greedy prefill/decode through the public request/event contract. |
+| G4.5 | `feat(dsv4f): add official sampling profiles` | Reuse the batch-1 FlashInfer sampler for temperature 1.0 with top-p 1.0/0.95, add fixed-logit/fixed-seed/distribution gates, and continue rejecting every unverified sampling option. |
+| G4.6 | `test(dsv4f): gate lifecycle and completions serving` | Add direct scheduler and HTTP gates for success, oversize, queue-full/429, waiting/admitted abort, slot reuse, injected fatal errors, explicit chat rejection, greedy correctness, and both official sampling profiles. |
+| G4.7 | `docs(dsv4f): close M1 correctness bring-up` | Record all G4 artifacts and limitations, state the exact `/v1/completions` contract, keep performance non-gating, and move every deferred feature into an explicit post-M1 next action. |
 
 ## Execution Log
 
@@ -620,6 +680,14 @@ After G4, run version-pinned vLLM and SGLang on matched prompts and sampling set
 - A complete `server` feature check reached existing frontend native dependencies, then stopped because this stripped login environment has no OpenSSL development headers or `pkg-config`. The repository development container specifies both, but Docker is unavailable on this node; no server-build pass is claimed here.
 - Result: G0 core gate green; full frontend/server compilation remains an environment follow-up, not a checkpoint-contract failure.
 
+### Step 24: Push, document review, and future commit boundaries
+
+- Pushed the four signed G0/planning commits to `Mrtroll486/pegainfer` as `feat/dsv4-flash` and set the local branch to track `origin/feat/dsv4-flash`. HTTPS push lacked credentials, so the successful push used the authenticated SSH equivalent while the configured `origin` URL remained HTTPS.
+- Reviewed the gate descriptions against the G0 crate, current `ServePlan`, weight-loader precedents, kernel ownership, and the oracle-first decision.
+- Corrected G1 so both 512 and 4,096 claims require concrete post-weight/post-state allocations, and assigned the missing model-scoped completions-only frontend capability explicitly to G4.
+- Split G1-G4 into ordered commits with reference artifacts before implementations, cross-cutting frontend/kernel ownership isolated, and one evidence-only documentation commit at each gate boundary.
+- Result: push succeeded; no gate policy changed, but the implementation and review boundaries are now explicit.
+
 ### Unexpected
 
 - The checkpoint's safetensor file total is 7,998,896 bytes larger than the manifest payload. This is expected container/header overhead; use manifest payload for tensor accounting and file total for storage accounting.
@@ -640,10 +708,9 @@ After G4, run version-pinned vLLM and SGLang on matched prompts and sampling set
   - Generating names from the architecture and comparing both directions catches missing tensors and newly introduced namespaces; enumerating the checkpoint itself would make those negative controls impossible.
   - Header-only mmap validation is sufficient for G0 and completes quickly without faulting 166 GB of payload into memory.
 - **Follow-ups**:
-  - Next action is G1: consume the G0 ledger in a no-duplicate streaming loader, implement the bounded scale repacks, and measure final/peak single-B300 residency before allocating runtime state.
+  - Next action is G1.1-G1.5: consume the G0 ledger in a no-duplicate streaming loader, resolve bounded scale repacks, measure the weight-only phase, then allocate the real 512/4,096 state shapes and close the final single-B300 residency gate.
   - Run the `dsv4f` server feature check in `docker/Dockerfile.dev` (or an equivalent host with OpenSSL development headers and `pkg-config`) before treating the model-line wiring as build-verified.
   - Generate and hash the official MP1 reference checkpoint before producing the primary oracle fixtures; keep it outside the repository and outside PegaInfer's runtime contract.
-  - After G0, run G1 as a load-only executable before implementing the complete forward path.
   - After M1, add whole-prompt or chunked prefill and gate its terminal state and logits against token-by-token prefill.
   - After M1, implement real FP8 main KV and packed FP4 indexer KV, then gate dequantized values, top-k, attention, and logits against the fake-quant cache path.
   - Use the 4096-token profile to gather the first long-run runtime and memory evidence before raising the default 512-token serving ceiling.
