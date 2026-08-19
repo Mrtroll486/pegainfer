@@ -3845,6 +3845,7 @@ dependencies = [
  "log",
  "pegainfer-core",
  "pegainfer-deepseek-v2-lite",
+ "pegainfer-dsv4f",
  "pegainfer-frontend",
  "pegainfer-gemma4",
  "pegainfer-glm52",

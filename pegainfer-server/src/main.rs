@@ -25,6 +25,8 @@ fn model_lines() -> Vec<&'static dyn ModelLine> {
     vec![
         #[cfg(feature = "deepseek-v2-lite")]
         &pegainfer_deepseek_v2_lite::model_line::MODEL_LINE,
+        #[cfg(feature = "dsv4f")]
+        &pegainfer_dsv4f::model_line::MODEL_LINE,
         #[cfg(feature = "gemma4")]
         &pegainfer_gemma4::model_line::MODEL_LINE,
         #[cfg(feature = "glm52")]
@@ -68,6 +70,12 @@ fn feature_gate_hint(config: &serde_json::Value) -> Option<String> {
             model_types: &["deepseek_v2"],
             text_model_types: &[],
             compiled: cfg!(feature = "deepseek-v2-lite"),
+        },
+        Family {
+            feature: "dsv4f",
+            model_types: &["deepseek_v4"],
+            text_model_types: &[],
+            compiled: cfg!(feature = "dsv4f"),
         },
         Family {
             feature: "gemma4",
@@ -267,6 +275,14 @@ mod tests {
         let config = serde_json::json!({"model_type": "glm_moe_dsa"});
         let hint = feature_gate_hint(&config).expect("glm52 identity should hint");
         assert!(hint.contains("--features glm52"), "{hint}");
+    }
+
+    #[cfg(not(feature = "dsv4f"))]
+    #[test]
+    fn hint_names_dsv4f_for_an_uncompiled_deepseek_v4() {
+        let config = serde_json::json!({"model_type": "deepseek_v4"});
+        let hint = feature_gate_hint(&config).expect("DSV4F identity should hint");
+        assert!(hint.contains("--features dsv4f"), "{hint}");
     }
 
     #[cfg(not(feature = "gemma4"))]
