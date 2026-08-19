@@ -102,6 +102,12 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/k3/mtp-dspark.md` | K3 speculative decoding via RadixArk's DSpark drafter (DFlash block-diffusion, block 7, not a classic MTP head) — live end-to-end: `--dflash-draft-model-path` arms a per-rank draft lane, a packed verify step with deferred-commit KDA replay commits blocks, full-depth EP4 serve accepts at reference rates (3.3/round cycle, 3.13 prose — matching same-checkpoint sglang) after the Markov row off-by-one fix. Six `spec_verify` gates certify what is exact (verify ≠ plain decode bitwise by construction). |
 | `models/k3/serving-roadmap.md` | The K3 serving deliverable: TP x × DP y × EP (x·y) with TP intra-tray only (x ≤ 4), plus MTP via RadixArk/Kimi-K3-DSpark. Multi-node gate cleared 2026-08 (fabric transport, ep8-ep64 worlds, ssh fleet launcher — see multi-node-ep.md); next: attention TP, MTP; side list: varlen prefill packing, full-depth TTFT baseline, real sampling, kv-store reuse. |
 
+## models / dsv4f
+
+| Path | TL;DR |
+| --- | --- |
+| `models/dsv4f/adaptation-plan.md` | DeepSeek V4 Flash single-B300 bring-up record: local 155.4 GiB checkpoint; conservative EP1/eager M1 with greedy G0-G3 and official temperature/top-p profiles at G4; model-owned 128-token compressed-KV pages plus slot-local mutable state; prefix/offload/P-D/DSpark deferred; residency, layouts, kernels, and oracle fixtures remain explicit gates. |
+
 ## models / deepseek-v2-lite
 
 | Path | TL;DR |
