@@ -16,6 +16,8 @@ use pegainfer_frontend::engine::SpecDecodeCounters;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::spawn_scheduler;
 
+pub mod profile;
+
 /// Cap on how long `step` parks while waiting for the next due token. New
 /// submissions only drain between steps, so a full TTFT/TPOT sleep would
 /// stall admission; 1ms keeps the CPU-only sim from spinning a core.
