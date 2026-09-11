@@ -17,6 +17,7 @@ use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::spawn_scheduler;
 
 pub mod profile;
+pub mod worker;
 
 /// Cap on how long `step` parks while waiting for the next due token. New
 /// submissions only drain between steps, so a full TTFT/TPOT sleep would

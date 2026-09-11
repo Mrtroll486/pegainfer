@@ -118,7 +118,7 @@ pub struct SchedulerProfile {
 }
 
 impl SchedulerProfile {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
             self.max_num_seqs > 0,
             "scheduler.max_num_seqs must be positive"
