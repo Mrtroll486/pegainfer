@@ -35,11 +35,11 @@ impl RequestId {
 pub struct PrefillStepItem {
     pub(crate) request_id: RequestId,
     pub(crate) prompt_tokens: Vec<u32>,
-    pub(crate) logprobs: usize,
+    pub(crate) logprobs: Option<usize>,
 }
 
 impl PrefillStepItem {
-    pub fn new(request_id: RequestId, prompt_tokens: Vec<u32>, logprobs: usize) -> Self {
+    pub fn new(request_id: RequestId, prompt_tokens: Vec<u32>, logprobs: Option<usize>) -> Self {
         Self {
             request_id,
             prompt_tokens,
@@ -52,11 +52,11 @@ impl PrefillStepItem {
 pub struct DecodeStepItem {
     pub(crate) request_id: RequestId,
     pub(crate) token_id: u32,
-    pub(crate) logprobs: usize,
+    pub(crate) logprobs: Option<usize>,
 }
 
 impl DecodeStepItem {
-    pub fn new(request_id: RequestId, token_id: u32, logprobs: usize) -> Self {
+    pub fn new(request_id: RequestId, token_id: u32, logprobs: Option<usize>) -> Self {
         Self {
             request_id,
             token_id,
@@ -167,14 +167,21 @@ impl Qwen35Executor {
         let mut recurrent_states: Vec<RecurrentState> = plan
             .requests
             .iter()
-            .map(|_| RecurrentState::new(self.model.device_ctx(), self.model.config()))
+            .map(|_| {
+                RecurrentState::new(
+                    self.model.device_ctx(),
+                    self.model.config(),
+                    self.model.geometry,
+                )
+            })
             .collect::<Result<_>>()?;
         let mut recurrent_refs: Vec<&mut RecurrentState> = recurrent_states.iter_mut().collect();
         let logits =
             self.model
                 .batch_prefill_logits(&prompts, &mut kv_states, &mut recurrent_refs)?;
 
-        let requested_logprobs: Vec<usize> = plan.requests.iter().map(|req| req.logprobs).collect();
+        let requested_logprobs: Vec<Option<usize>> =
+            plan.requests.iter().map(|req| req.logprobs).collect();
         let cpu_logits =
             snapshot_requested_logprobs(self.model.device_ctx(), &logits, &requested_logprobs)?;
         let tokens =
@@ -183,8 +190,8 @@ impl Qwen35Executor {
         let mut results = Vec::with_capacity(plan.requests.len());
         for (i, (req, kv)) in plan.requests.iter().zip(kv_states).enumerate() {
             let first_token = tokens[i];
-            let first_token_logprob = cpu_logits[i].as_ref().and_then(|row| {
-                pegainfer_sample::token_logprob_from_row(row, first_token, req.logprobs)
+            let first_token_logprob = cpu_logits[i].as_ref().and_then(|(row, top_k)| {
+                pegainfer_sample::token_logprob_from_row(row, first_token, *top_k)
             });
             let slot_idx = self.active.len();
             self.graph_state.copy_state_to_slot(
@@ -226,10 +233,15 @@ impl Qwen35Executor {
         let token_ids: Vec<u32> = plan.requests.iter().map(|req| req.token_id).collect();
         let mut kv_refs: Vec<&mut KvState> =
             self.active.iter_mut().map(|req| &mut req.kv).collect();
-        self.model
-            .batch_decode_graph(&token_ids, &mut kv_refs, &mut self.graph_state)?;
+        self.model.batch_decode_graph(
+            &token_ids,
+            &mut kv_refs,
+            &mut self.graph_state,
+            crate::batch_decode::DecodeGraphUse::Serve,
+        )?;
 
-        let requested_logprobs: Vec<usize> = plan.requests.iter().map(|req| req.logprobs).collect();
+        let requested_logprobs: Vec<Option<usize>> =
+            plan.requests.iter().map(|req| req.logprobs).collect();
         let cpu_logits = snapshot_requested_logprobs(
             self.model.device_ctx(),
             &self.graph_state.buffers.logits,
@@ -246,9 +258,9 @@ impl Qwen35Executor {
         let mut results = Vec::with_capacity(plan.requests.len());
         for (i, req) in plan.requests.iter().enumerate() {
             let token = tokens[i];
-            let logprob = cpu_logits[i]
-                .as_ref()
-                .and_then(|row| pegainfer_sample::token_logprob_from_row(row, token, req.logprobs));
+            let logprob = cpu_logits[i].as_ref().and_then(|(row, top_k)| {
+                pegainfer_sample::token_logprob_from_row(row, token, *top_k)
+            });
             results.push(DecodeRequestResult {
                 request_id: req.request_id,
                 token,

@@ -49,6 +49,9 @@ use pegainfer_kernels::ops::logprob_topk_batch_bf16_into;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::HiddenStates;
 use pegainfer_kernels::tensor::has_stream_override;
+use pegainfer_kernels::tensor::stream_spin_wait;
+
+const STAGED_READBACK_SLOTS: usize = 2;
 
 /// Allocate-once device buffers for [`select_batch`], sized for `max_rows` × `vocab`.
 ///
@@ -72,6 +75,10 @@ pub struct SampleScratch {
     /// active stream (#704). Pinned keeps the D2H async; the reader blocks
     /// only on the copy's own event.
     argmax_host: PinnedHostSlice<i32>,
+    /// Alternate landing slot used while the prior readback is collected.
+    argmax_host_alt: PinnedHostSlice<i32>,
+    /// Identity row map for the all-greedy staged path.
+    identity_rows: CudaSlice<i32>,
     sampling: BatchSamplingScratch,
     /// Vocab width every buffer above was sized for; `select_batch` rejects a
     /// logits arena whose `hidden_dim` differs, since the sizes are baked in.
@@ -109,6 +116,12 @@ impl SampleScratch {
             // but don't grow this buffer into anything read in a hot loop.
             argmax_host: unsafe { ctx.ctx.alloc_pinned::<i32>(max_rows) }
                 .map_err(|e| anyhow!("SampleScratch pinned alloc failed: {e}"))?,
+            argmax_host_alt: unsafe { ctx.ctx.alloc_pinned::<i32>(max_rows) }
+                .map_err(|e| anyhow!("SampleScratch pinned alloc failed: {e}"))?,
+            identity_rows: ctx
+                .stream
+                .clone_htod(&(0..max_rows as i32).collect::<Vec<_>>())
+                .map_err(|e| anyhow!("SampleScratch identity upload failed: {e}"))?,
             sampling: BatchSamplingScratch::new(ctx, max_rows, vocab)?,
             vocab,
             max_rows,
@@ -117,6 +130,10 @@ impl SampleScratch {
 
     pub fn max_rows(&self) -> usize {
         self.max_rows
+    }
+
+    pub fn vocab(&self) -> usize {
+        self.vocab
     }
 }
 
@@ -207,7 +224,9 @@ pub fn select_batch(
             .map_err(|e| anyhow!("select_batch D2H greedy tokens failed: {e}"))?;
         // Blocks on this copy's own event — which transitively covers the
         // argmax kernel queued before it on the same stream, so the wait is
-        // equivalent to the old full-stream sync for this path.
+        // equivalent to the old full-stream sync for this path. The spin
+        // ahead of it takes the scheduler wake-up out of the step loop.
+        stream_spin_wait(ctx)?;
         let out = scratch
             .argmax_host
             .as_slice()
@@ -275,6 +294,119 @@ pub fn select_batch(
     Ok(tokens)
 }
 
+fn validate_greedy_shape(
+    logits: &HiddenStates,
+    rows: usize,
+    scratch: &SampleScratch,
+) -> Result<()> {
+    ensure!(rows > 0, "greedy_argmax_ids: empty batch");
+    ensure!(
+        rows <= scratch.max_rows,
+        "greedy_argmax_ids: {rows} rows exceeds scratch capacity {}",
+        scratch.max_rows
+    );
+    ensure!(
+        logits.seq_len >= rows && logits.hidden_dim == scratch.vocab,
+        "greedy_argmax_ids: logits shape {}x{} cannot serve {rows} rows x vocab {}",
+        logits.seq_len,
+        logits.hidden_dim,
+        scratch.vocab
+    );
+    Ok(())
+}
+
+/// Capturable base-stream-only argmax and device copy into the next embedding's id buffer.
+pub fn greedy_argmax_ids(
+    ctx: &DeviceContext,
+    logits: &HiddenStates,
+    rows: usize,
+    ids_out: &mut CudaSlice<u32>,
+    scratch: &mut SampleScratch,
+) -> Result<()> {
+    ensure!(
+        !has_stream_override(),
+        "the staged sampler path runs on the base stream only"
+    );
+    validate_greedy_shape(logits, rows, scratch)?;
+    argmax_batch_bf16_split_indexed_into(
+        ctx,
+        logits,
+        &scratch.identity_rows,
+        rows,
+        &mut scratch.argmax_partial_values,
+        &mut scratch.argmax_partial_indices,
+        &mut scratch.top1_values,
+        &mut scratch.argmax_out,
+    )?;
+    pegainfer_kernels::tensor::memcpy_dtod_u32_from_i32(ctx, &scratch.argmax_out, ids_out, rows)
+}
+
+/// Queue the base-stream-only pinned readback outside the sampler graph.
+pub fn greedy_stage_readback(
+    ctx: &DeviceContext,
+    slot: usize,
+    scratch: &mut SampleScratch,
+) -> Result<()> {
+    ensure!(
+        !has_stream_override(),
+        "the staged sampler path runs on the base stream only"
+    );
+    ensure!(
+        slot < STAGED_READBACK_SLOTS,
+        "greedy_stage_readback: slot {slot} out of range"
+    );
+    let host = if slot == 0 {
+        &mut scratch.argmax_host
+    } else {
+        &mut scratch.argmax_host_alt
+    };
+    ctx.stream
+        .memcpy_dtoh(&scratch.argmax_out, host)
+        .map_err(|e| anyhow!("greedy_stage_readback D2H stage failed: {e}"))
+}
+
+/// On the base stream, argmax every row, leave the picks in the next embedding's
+/// id buffer, and queue their pinned readback without waiting for it.
+pub fn greedy_stage_resident(
+    ctx: &DeviceContext,
+    logits: &HiddenStates,
+    rows: usize,
+    ids_out: &mut CudaSlice<u32>,
+    slot: usize,
+    scratch: &mut SampleScratch,
+) -> Result<()> {
+    ensure!(
+        !has_stream_override(),
+        "the staged sampler path runs on the base stream only"
+    );
+    greedy_argmax_ids(ctx, logits, rows, ids_out, scratch)?;
+    greedy_stage_readback(ctx, slot, scratch)
+}
+
+/// Collect a readback staged into one of the two pinned slots.
+pub fn greedy_collect_resident(
+    rows: usize,
+    slot: usize,
+    scratch: &mut SampleScratch,
+) -> Result<Vec<u32>> {
+    ensure!(
+        slot < STAGED_READBACK_SLOTS,
+        "greedy_collect_resident: slot {slot} out of range"
+    );
+    ensure!(
+        rows <= scratch.max_rows,
+        "greedy_collect_resident: {rows} rows exceeds scratch capacity {}",
+        scratch.max_rows
+    );
+    let landed = if slot == 0 {
+        scratch.argmax_host.as_slice()
+    } else {
+        scratch.argmax_host_alt.as_slice()
+    }
+    .map_err(|e| anyhow!("greedy_collect_resident D2H sync failed: {e}"))?;
+    Ok(landed[..rows].iter().map(|&token| token as u32).collect())
+}
+
 /// SplitMix64 over (seed, step): a distinct, well-mixed philox seed per
 /// request step, deterministic across runs and batch layouts. Public for the
 /// models that drive their own greedy path (see the module docs) and must
@@ -321,9 +453,13 @@ where
         return None;
     }
 
+    let picked_val: f32 = row[picked].into();
+    let mut rank = 0;
     let mut max = f32::NEG_INFINITY;
     for &v in row {
-        max = max.max(v.into());
+        let value = v.into();
+        max = max.max(value);
+        rank += u32::from(value >= picked_val);
     }
     let mut sum = 0f64;
     for &v in row {
@@ -350,9 +486,9 @@ where
         }
     }
 
-    let picked_val: f32 = row[picked].into();
     Some(TokenLogprob {
         logprob: picked_val - log_sum_exp,
+        rank,
         top_logprobs: top,
     })
 }
@@ -418,6 +554,10 @@ pub fn token_logprobs_batch(
         .stream
         .alloc_zeros(requests.len())
         .map_err(|e| anyhow!("token_logprobs_batch alloc failed: {e}"))?;
+    let mut ranks_gpu: CudaSlice<i32> = ctx
+        .stream
+        .alloc_zeros(requests.len())
+        .map_err(|e| anyhow!("token_logprobs_batch alloc failed: {e}"))?;
     let topk_len = requests
         .len()
         .checked_mul(k_max)
@@ -443,6 +583,7 @@ pub fn token_logprobs_batch(
             requests.len(),
             k_max,
             &mut picked_lp_gpu,
+            &mut ranks_gpu,
             &mut vals_gpu,
             &mut ids_gpu,
         )?;
@@ -451,6 +592,10 @@ pub fn token_logprobs_batch(
     let picked_lp = ctx
         .stream
         .clone_dtoh(&picked_lp_gpu)
+        .map_err(|e| anyhow!("token_logprobs_batch D2H failed: {e}"))?;
+    let ranks = ctx
+        .stream
+        .clone_dtoh(&ranks_gpu)
         .map_err(|e| anyhow!("token_logprobs_batch D2H failed: {e}"))?;
     let vals = ctx
         .stream
@@ -468,6 +613,7 @@ pub fn token_logprobs_batch(
             let base = i * k_max;
             TokenLogprob {
                 logprob: picked_lp[i],
+                rank: ranks[i] as u32,
                 top_logprobs: (0..k)
                     .map(|j| (ids[base + j] as u32, vals[base + j]))
                     .collect(),
@@ -493,6 +639,9 @@ mod tests {
 
         let out = token_logprob_from_row(&row, 2, 3).unwrap();
 
+        assert_eq!(out.rank, 3);
+        assert_eq!(token_logprob_from_row(&row, 0, 0).unwrap().rank, 4);
+        assert_eq!(token_logprob_from_row(&row, 1, 0).unwrap().rank, 2);
         assert!((out.logprob - (2.0 - lse)).abs() < 1e-6);
         // Top-3 sorted descending; tied logits keep ascending token-id order.
         let ids: Vec<u32> = out.top_logprobs.iter().map(|&(id, _)| id).collect();

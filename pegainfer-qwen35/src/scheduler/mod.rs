@@ -4,8 +4,9 @@
 //! - `RecurrentState` alongside `KvState` (linear attention layers)
 //! - `BatchDecodeGraphState` for CUDA Graph batch decode (stable-address slots)
 
+mod backend;
 mod plan;
-
+mod tp;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -42,6 +43,7 @@ use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
+use self::backend::*;
 use self::plan::ActiveDecodeState;
 use self::plan::ActiveKvBudget;
 use self::plan::ExecutionPlan;
@@ -55,6 +57,7 @@ use self::plan::max_kv_tokens;
 use self::plan::plan_prefill_chunks;
 use self::plan::prefilling_future_pages;
 use self::plan::slot_for_new_request;
+use self::tp::*;
 use crate::Qwen35DecodeOverlap;
 use crate::Qwen35SchedulerPolicy;
 use crate::batch_decode_graph::BatchDecodeGraphState;
@@ -69,6 +72,7 @@ use crate::tp_executor::DropExpectation;
 use crate::tp_executor::Qwen35TpExecutor;
 use crate::tp_executor::TpDecodeStepItem;
 use crate::tp_executor::TpPrefillChunkItem;
+use crate::tp_executor::TpSlotCompaction;
 use crate::tp_executor::TpUnifiedPlan;
 use crate::weights::Qwen35Model;
 
@@ -85,8 +89,8 @@ struct ActiveRequest35 {
     max_tokens: usize,
     prompt_len: usize,
     params: SamplingParams,
-    /// Number of top logprobs to return (0 = disabled).
-    logprobs: usize,
+    /// Optional top-logprob count; Some(0) scores only the chosen token.
+    logprobs: Option<usize>,
 }
 
 /// A request whose prompt is being prefilled across multiple scheduler steps.
@@ -109,6 +113,9 @@ enum ActiveBackendState {
     },
     Tp {
         request_id: RequestId,
+        /// Dense decode slot (`active` position). Graph-mode workers assert
+        /// `slot_idx == row` on every decode command; eager workers ignore it.
+        slot_idx: usize,
     },
 }
 
@@ -418,13 +425,19 @@ pub(crate) fn start_tp_with_capacity(
     device_ordinals: &[usize],
     max_batch: usize,
     max_prefill_tokens: usize,
+    enable_cuda_graph: bool,
 ) -> Result<SchedulerHandle> {
     assert!(
         max_prefill_tokens > 0,
         "max_prefill_tokens must be positive: a zero budget can never schedule a prefill chunk"
     );
-    let backend =
-        TpSchedulerBackend::new(model_path, device_ordinals, max_batch, max_prefill_tokens)?;
+    let backend = TpSchedulerBackend::new(
+        model_path,
+        device_ordinals,
+        max_batch,
+        max_prefill_tokens,
+        enable_cuda_graph,
+    )?;
     let servable = servable_len(
         backend.max_position_embeddings(),
         backend.capacity_pages_for_requests(),
@@ -462,559 +475,6 @@ pub(crate) fn start_tp_with_capacity(
     )
 }
 
-struct SingleGpuBackend {
-    model: Qwen35Model,
-    graph_state: BatchDecodeGraphState,
-    prefill_stream: Option<Arc<CudaStream>>,
-}
-
-// One instance per scheduler; the size asymmetry costs nothing here.
-#[allow(clippy::large_enum_variant)]
-enum SchedulerBackend {
-    Single(SingleGpuBackend),
-    Tp(TpSchedulerBackend),
-}
-
-struct AsyncPrefillOutput {
-    logits: Option<HiddenStates>,
-    done: CudaEvent,
-    stream: Arc<CudaStream>,
-    completed: bool,
-}
-
-impl AsyncPrefillOutput {
-    fn is_ready(&mut self) -> bool {
-        match unsafe { sys::cuEventQuery(self.done.cu_event()) } {
-            sys::CUresult::CUDA_SUCCESS => {
-                self.completed = true;
-                true
-            }
-            sys::CUresult::CUDA_ERROR_NOT_READY => false,
-            err => fatal_cuda_lifecycle(&format!(
-                "query Qwen3.5 async prefill event failed: {err:?}"
-            )),
-        }
-    }
-
-    fn into_logits(mut self) -> HiddenStates {
-        if !self.completed {
-            if let Err(err) = self.done.synchronize() {
-                fatal_cuda_lifecycle(&format!("wait for Qwen3.5 async prefill failed: {err}"));
-            }
-            self.completed = true;
-        }
-        self.logits
-            .take()
-            .expect("async prefill logits must be consumed exactly once")
-    }
-}
-
-impl Drop for AsyncPrefillOutput {
-    fn drop(&mut self) {
-        if self.completed {
-            return;
-        }
-        if let Err(err) = self.stream.synchronize() {
-            fatal_cuda_lifecycle(&format!(
-                "drain Qwen3.5 async prefill during cleanup failed: {err}"
-            ));
-        }
-    }
-}
-
-fn fatal_cuda_lifecycle(message: &str) -> ! {
-    log::error!("FATAL: {message}; aborting before CUDA-referenced state is released");
-    std::process::abort();
-}
-
-struct TpSchedulerBackend {
-    executor: Qwen35TpExecutor,
-    next_request_id: u64,
-}
-
-impl SingleGpuBackend {
-    fn new(
-        model: Qwen35Model,
-        max_batch: usize,
-        decode_overlap: Qwen35DecodeOverlap,
-    ) -> Result<Self> {
-        anyhow::ensure!(max_batch > 0, "Qwen3.5 max_batch must be > 0");
-        let graph_capacity = crate::batch_decode_graph::bucket_for(max_batch);
-        let graph_state = model.create_batch_decode_graph_state_with_capacity(graph_capacity)?;
-        let prefill_stream = match decode_overlap {
-            Qwen35DecodeOverlap::Off => None,
-            Qwen35DecodeOverlap::SharedSm => Some(
-                model
-                    .device_ctx()
-                    .ctx
-                    .new_stream()
-                    .map_err(|err| anyhow::anyhow!("create Qwen3.5 prefill stream: {err}"))?,
-            ),
-        };
-        Ok(Self {
-            model,
-            graph_state,
-            prefill_stream,
-        })
-    }
-
-    fn model(&self) -> &Qwen35Model {
-        &self.model
-    }
-
-    fn max_batch(&self) -> usize {
-        // #470: admit the requested `--max-batch`, which may sit below the loaded
-        // graph bucket (e.g. 5 on bucket 8); never exceed the physical slots.
-        self.model
-            .decode_admission_batch
-            .min(self.graph_state.slot_states.len())
-            .max(1)
-    }
-
-    fn page_size(&self) -> usize {
-        self.model.kv_pool().layout().page_size
-    }
-
-    fn available_pages(&self) -> usize {
-        self.model.kv_pool().available_pages()
-    }
-
-    fn capacity_pages_for_requests(&self) -> usize {
-        self.model.kv_pool().capacity_pages().saturating_sub(1)
-    }
-
-    fn max_position_embeddings(&self) -> usize {
-        self.model.config().max_position_embeddings
-    }
-
-    fn alloc_kv(&self) -> KvState {
-        self.model.alloc_kv()
-    }
-
-    fn alloc_recurrent(&self) -> Result<RecurrentState> {
-        RecurrentState::new(self.model.device_ctx(), self.model.config())
-    }
-
-    fn batch_prefill_logits(&self, chunk: &mut ScheduledChunk) -> Result<HiddenStates> {
-        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(Vec::as_slice).collect();
-        let ScheduledChunkBackendState::Single { kvs, recs } = &mut chunk.backend_state else {
-            anyhow::bail!("single-GPU prefill received TP chunk state");
-        };
-        let mut rec_refs: Vec<&mut RecurrentState> = recs.iter_mut().collect();
-        self.model
-            .batch_prefill_logits(&window_refs, kvs, &mut rec_refs)
-    }
-
-    fn overlap_enabled(&self) -> bool {
-        self.prefill_stream.is_some()
-    }
-
-    fn launch_async_prefill(&mut self, chunk: &mut ScheduledChunk) -> Result<AsyncPrefillOutput> {
-        let prefill_stream = self
-            .prefill_stream
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 decode overlap is disabled"))?;
-
-        // Request KV/recurrent state was allocated on the model stream. Order
-        // those producers before the prefill stream without blocking the host.
-        prefill_stream
-            .join(&self.model.device_ctx().stream)
-            .map_err(|err| anyhow::anyhow!("join Qwen3.5 prefill stream: {err}"))?;
-
-        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(Vec::as_slice).collect();
-        let ScheduledChunkBackendState::Single { kvs, recs } = &mut chunk.backend_state else {
-            anyhow::bail!("single-GPU async prefill received TP chunk state");
-        };
-        let mut rec_refs: Vec<&mut RecurrentState> = recs.iter_mut().collect();
-        let logits = match self.model.batch_prefill_logits_on_stream(
-            Arc::clone(&prefill_stream),
-            &window_refs,
-            kvs,
-            &mut rec_refs,
-        ) {
-            Ok(logits) => logits,
-            Err(err) => {
-                if let Err(sync_err) = prefill_stream.synchronize() {
-                    fatal_cuda_lifecycle(&format!(
-                        "Qwen3.5 async prefill failed ({err}); stream drain failed: {sync_err}"
-                    ));
-                }
-                return Err(err);
-            }
-        };
-        let done = match prefill_stream.record_event(None) {
-            Ok(done) => done,
-            Err(err) => {
-                if let Err(sync_err) = prefill_stream.synchronize() {
-                    fatal_cuda_lifecycle(&format!(
-                        "record Qwen3.5 async prefill event failed ({err}); stream drain failed: {sync_err}"
-                    ));
-                }
-                return Err(anyhow::anyhow!("record Qwen3.5 async prefill event: {err}"));
-            }
-        };
-        Ok(AsyncPrefillOutput {
-            logits: Some(logits),
-            done,
-            stream: prefill_stream,
-            completed: false,
-        })
-    }
-
-    fn unified_step(
-        &mut self,
-        chunk: &mut ScheduledChunk,
-        active: &mut [ActiveRequest35],
-    ) -> Result<crate::unified_forward::UnifiedStepOutput> {
-        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(Vec::as_slice).collect();
-        let ScheduledChunkBackendState::Single { kvs, recs } = &mut chunk.backend_state else {
-            anyhow::bail!("single-GPU unified step received TP chunk state");
-        };
-        let mut rec_refs: Vec<&mut RecurrentState> = recs.iter_mut().collect();
-        let decode_tokens: Vec<u32> = active.iter().map(|r| r.last_token).collect();
-        let mut decode_kv_refs: Vec<&mut KvState> = active
-            .iter_mut()
-            .map(|r| match &mut r.backend_state {
-                ActiveBackendState::Single { kv, .. } => kv,
-                ActiveBackendState::Tp { .. } => {
-                    panic!("single-GPU unified step received TP active state")
-                }
-            })
-            .collect();
-        self.model.unified_step(
-            &window_refs,
-            kvs,
-            &mut rec_refs,
-            &decode_tokens,
-            &mut decode_kv_refs,
-            &mut self.graph_state,
-        )
-    }
-
-    fn decode_graph(&mut self, active: &mut [ActiveRequest35]) -> Result<()> {
-        let token_ids: Vec<u32> = active.iter().map(|r| r.last_token).collect();
-        let mut kv_refs: Vec<&mut KvState> = active
-            .iter_mut()
-            .map(|r| match &mut r.backend_state {
-                ActiveBackendState::Single { kv, .. } => kv,
-                ActiveBackendState::Tp { .. } => {
-                    panic!("single-GPU decode received TP active state")
-                }
-            })
-            .collect();
-        self.model
-            .batch_decode_graph(&token_ids, &mut kv_refs, &mut self.graph_state)
-    }
-
-    fn sample_prefill_logits(
-        &mut self,
-        pending: &[SchedulerRequest],
-        logits: &HiddenStates,
-        sample_seed: u64,
-    ) -> Result<(Vec<u32>, Vec<Option<TokenLogprob>>)> {
-        debug_assert_eq!(
-            logits.seq_len,
-            pending.len(),
-            "Qwen3.5 prefill logits rows must preserve pending request order"
-        );
-        let requested_logprobs: Vec<usize> = pending.iter().map(|r| r.logprobs).collect();
-        let cpu_logits =
-            snapshot_requested_logprobs(self.model.device_ctx(), logits, &requested_logprobs)?;
-        let params_refs: Vec<&SamplingParams> = pending.iter().map(|r| &r.params).collect();
-        let tokens = self.model.select_tokens_from_logits_varied(
-            logits,
-            &mut self.graph_state.buffers,
-            &params_refs,
-            sample_seed,
-        )?;
-
-        let logprobs = cpu_logits
-            .into_iter()
-            .enumerate()
-            .map(|(i, logits_opt)| {
-                logits_opt.and_then(|logits_f32| {
-                    pegainfer_sample::token_logprob_from_row(
-                        &logits_f32,
-                        tokens[i],
-                        pending[i].logprobs,
-                    )
-                })
-            })
-            .collect();
-        Ok((tokens, logprobs))
-    }
-
-    fn sample_decode_logits(
-        &mut self,
-        active: &[ActiveRequest35],
-        sample_seed: u64,
-    ) -> Result<(Vec<u32>, Vec<Option<TokenLogprob>>)> {
-        let requested_logprobs: Vec<usize> = active.iter().map(|r| r.logprobs).collect();
-        let cpu_logits = snapshot_requested_logprobs(
-            self.model.device_ctx(),
-            &self.graph_state.buffers.logits,
-            &requested_logprobs,
-        )?;
-        let params_refs: Vec<&SamplingParams> = active.iter().map(|r| &r.params).collect();
-        let tokens = self.model.select_tokens_batch_varied(
-            &mut self.graph_state.buffers,
-            &params_refs,
-            sample_seed,
-        )?;
-
-        let logprobs = cpu_logits
-            .into_iter()
-            .enumerate()
-            .map(|(i, logits_opt)| {
-                logits_opt.and_then(|logits_f32| {
-                    pegainfer_sample::token_logprob_from_row(
-                        &logits_f32,
-                        tokens[i],
-                        active[i].logprobs,
-                    )
-                })
-            })
-            .collect();
-        Ok((tokens, logprobs))
-    }
-
-    fn is_stop_token(&self, token: u32) -> bool {
-        self.model.is_stop_token(token)
-    }
-
-    fn copy_recurrent_to_slot(
-        &mut self,
-        recurrent: &RecurrentState,
-        slot_idx: usize,
-    ) -> Result<()> {
-        self.graph_state
-            .copy_state_to_slot(self.model.device_ctx(), recurrent, slot_idx)
-    }
-
-    fn compact_slot(&mut self, active: &mut [ActiveRequest35], compaction: plan::SlotCompaction) {
-        let src_slot = match active[compaction.moved_to].backend_state {
-            ActiveBackendState::Single { graph_slot_idx, .. } => graph_slot_idx,
-            ActiveBackendState::Tp { .. } => {
-                panic!("single-GPU slot compaction received TP active state")
-            }
-        };
-        debug_assert_eq!(src_slot, compaction.moved_from);
-
-        let ctx = self.model.device_ctx();
-        let src = &self.graph_state.slot_states[compaction.moved_from];
-        for layer_idx in 0..src.layers.len() {
-            let (src_part, dst_part) = if compaction.moved_to < compaction.moved_from {
-                let (left, right) = self
-                    .graph_state
-                    .slot_states
-                    .split_at_mut(compaction.moved_from);
-                (
-                    &right[0].layers[layer_idx],
-                    &mut left[compaction.moved_to].layers[layer_idx],
-                )
-            } else {
-                unreachable!("idx < active.len() <= last");
-            };
-
-            ctx.stream
-                .memcpy_dtod(&src_part.state, &mut dst_part.state)
-                .expect("compact slot state copy failed");
-            ctx.stream
-                .memcpy_dtod(&src_part.conv_state.data, &mut dst_part.conv_state.data)
-                .expect("compact slot conv_state copy failed");
-        }
-        self.graph_state.slot_states[compaction.moved_to].seq_len =
-            self.graph_state.slot_states[compaction.moved_from].seq_len;
-
-        match &mut active[compaction.moved_to].backend_state {
-            ActiveBackendState::Single { graph_slot_idx, .. } => {
-                *graph_slot_idx = compaction.moved_to;
-            }
-            ActiveBackendState::Tp { .. } => {
-                panic!("single-GPU slot compaction received TP active state")
-            }
-        }
-    }
-}
-
-impl TpSchedulerBackend {
-    fn new(
-        model_path: &str,
-        device_ordinals: &[usize],
-        max_batch: usize,
-        max_prefill_tokens: usize,
-    ) -> Result<Self> {
-        let executor = Qwen35TpExecutor::from_runtime_with_limits(
-            model_path,
-            false,
-            device_ordinals,
-            max_batch,
-            max_prefill_tokens,
-        )?;
-        Ok(Self {
-            executor,
-            next_request_id: 1,
-        })
-    }
-
-    fn alloc_request_id(&mut self) -> RequestId {
-        let id = RequestId::new(self.next_request_id);
-        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
-        id
-    }
-
-    fn max_batch(&self) -> usize {
-        self.executor.max_batch()
-    }
-
-    fn page_size(&self) -> usize {
-        self.executor.page_size()
-    }
-
-    fn capacity_pages_for_requests(&self) -> usize {
-        self.executor.capacity_pages_for_requests()
-    }
-
-    fn max_position_embeddings(&self) -> usize {
-        self.executor.max_position_embeddings()
-    }
-
-    fn is_stop_token(&self, token: u32) -> bool {
-        self.executor.is_stop_token(token)
-    }
-
-    fn available_pages(
-        &self,
-        active: &[ActiveRequest35],
-        prefilling: &[PrefillingRequest35],
-    ) -> usize {
-        let page_size = self.page_size();
-        let active_pages: usize = active
-            .iter()
-            .map(|req| pages_needed(current_active_tokens(req), page_size))
-            .sum();
-        let prefilling_pages: usize = prefilling
-            .iter()
-            .map(|req| pages_needed(req.cursor, page_size))
-            .sum();
-        self.capacity_pages_for_requests()
-            .saturating_sub(active_pages.saturating_add(prefilling_pages))
-    }
-
-    fn execute_prefill_chunk(
-        &self,
-        chunk: &ScheduledChunk,
-        sample_seed: u64,
-    ) -> Result<Vec<Option<PrefillArtifact>>> {
-        let items = tp_prefill_items(chunk)?;
-        let result = self
-            .executor
-            .execute_prefill_chunks_with_seed(&items, sample_seed)?;
-        align_prefill_results(chunk, &result)
-            .map_err(|err| self.executor.poison_artifact_contract("prefill", &err))
-    }
-
-    fn execute_decode(
-        &self,
-        active: &[ActiveRequest35],
-        sample_seed: u64,
-    ) -> Result<Vec<DecodeArtifact>> {
-        let items = tp_decode_items(active)?;
-        let result = self.executor.execute_decode_items(&items, sample_seed)?;
-        align_decode_results(active, &result)
-            .map_err(|err| self.executor.poison_artifact_contract("decode", &err))
-    }
-
-    fn execute_unified(
-        &self,
-        chunk: &ScheduledChunk,
-        active: &[ActiveRequest35],
-        decode_sample_seed: u64,
-        prefill_sample_seed: u64,
-    ) -> Result<AlignedUnifiedArtifacts> {
-        let plan = TpUnifiedPlan {
-            prefill: tp_prefill_items(chunk)?,
-            decode: tp_decode_items(active)?,
-            prefill_sample_seed,
-            decode_sample_seed,
-        };
-        let result = self.executor.execute_unified(&plan)?;
-        let prefill = align_prefill_results(chunk, &result.prefill).map_err(|err| {
-            self.executor
-                .poison_artifact_contract("unified prefill", &err)
-        })?;
-        let decode = align_decode_results(active, &result.decode).map_err(|err| {
-            self.executor
-                .poison_artifact_contract("unified decode", &err)
-        })?;
-        Ok(AlignedUnifiedArtifacts { prefill, decode })
-    }
-
-    fn drop_request(&self, request_id: RequestId, expectation: DropExpectation) -> Result<()> {
-        self.executor.drop_request(request_id, expectation)
-    }
-}
-
-impl SchedulerBackend {
-    fn max_batch(&self) -> usize {
-        match self {
-            Self::Single(backend) => backend.max_batch(),
-            Self::Tp(backend) => backend.max_batch(),
-        }
-    }
-
-    fn page_size(&self) -> usize {
-        match self {
-            Self::Single(backend) => backend.page_size(),
-            Self::Tp(backend) => backend.page_size(),
-        }
-    }
-
-    fn available_pages(
-        &self,
-        active: &[ActiveRequest35],
-        prefilling: &[PrefillingRequest35],
-    ) -> usize {
-        match self {
-            Self::Single(backend) => backend.available_pages(),
-            Self::Tp(backend) => backend.available_pages(active, prefilling),
-        }
-    }
-
-    fn capacity_pages_for_requests(&self) -> usize {
-        match self {
-            Self::Single(backend) => backend.capacity_pages_for_requests(),
-            Self::Tp(backend) => backend.capacity_pages_for_requests(),
-        }
-    }
-
-    fn max_position_embeddings(&self) -> usize {
-        match self {
-            Self::Single(backend) => backend.max_position_embeddings(),
-            Self::Tp(backend) => backend.max_position_embeddings(),
-        }
-    }
-
-    fn alloc_prefill_state(&mut self) -> Result<PrefillBackendState> {
-        match self {
-            Self::Single(backend) => Ok(PrefillBackendState::Single {
-                kv: backend.alloc_kv(),
-                rec: backend.alloc_recurrent()?,
-            }),
-            Self::Tp(backend) => Ok(PrefillBackendState::Tp {
-                request_id: backend.alloc_request_id(),
-            }),
-        }
-    }
-
-    fn is_stop_token(&self, token: u32) -> bool {
-        match self {
-            Self::Single(backend) => backend.is_stop_token(token),
-            Self::Tp(backend) => backend.is_stop_token(token),
-        }
-    }
-}
-
 fn current_active_tokens(req: &ActiveRequest35) -> usize {
     req.prompt_len
         .saturating_add(req.generated_count.saturating_sub(1))
@@ -1022,176 +482,6 @@ fn current_active_tokens(req: &ActiveRequest35) -> usize {
 
 fn pages_needed(token_count: usize, page_size: usize) -> usize {
     token_count.div_ceil(page_size)
-}
-
-fn tp_prefill_items(chunk: &ScheduledChunk) -> Result<Vec<TpPrefillChunkItem>> {
-    let ScheduledChunkBackendState::Tp { request_ids } = &chunk.backend_state else {
-        anyhow::bail!("TP prefill received single-GPU chunk state");
-    };
-    anyhow::ensure!(
-        chunk.reqs.len() == request_ids.len()
-            && chunk.reqs.len() == chunk.windows.len()
-            && chunk.reqs.len() == chunk.ends.len(),
-        "Qwen3.5 TP scheduled prefill vectors are misaligned"
-    );
-    Ok(chunk
-        .reqs
-        .iter()
-        .zip(request_ids)
-        .zip(&chunk.windows)
-        .zip(&chunk.ends)
-        .map(|(((req, request_id), window), end)| {
-            TpPrefillChunkItem::new_with_sampling(
-                *request_id,
-                window.clone(),
-                req.logprobs,
-                req.params,
-                *end == req.prompt_tokens.len(),
-            )
-        })
-        .collect())
-}
-
-fn tp_decode_items(active: &[ActiveRequest35]) -> Result<Vec<TpDecodeStepItem>> {
-    active
-        .iter()
-        .map(|req| {
-            let ActiveBackendState::Tp { request_id } = &req.backend_state else {
-                anyhow::bail!("TP decode received single-GPU active state");
-            };
-            Ok(TpDecodeStepItem::new(
-                *request_id,
-                req.last_token,
-                req.logprobs,
-                req.params,
-            ))
-        })
-        .collect()
-}
-
-fn align_prefill_results(
-    chunk: &ScheduledChunk,
-    result: &PrefillResult,
-) -> Result<Vec<Option<PrefillArtifact>>> {
-    let ScheduledChunkBackendState::Tp { request_ids } = &chunk.backend_state else {
-        anyhow::bail!("align_prefill_results requires TP chunk state");
-    };
-    anyhow::ensure!(
-        request_ids.len() == chunk.reqs.len() && chunk.ends.len() == chunk.reqs.len(),
-        "Qwen3.5 TP prefill alignment vectors are misaligned"
-    );
-    let expected: HashSet<RequestId> = request_ids
-        .iter()
-        .zip(&chunk.reqs)
-        .zip(&chunk.ends)
-        .filter_map(|((&request_id, req), &end)| {
-            (end == req.prompt_tokens.len()).then_some(request_id)
-        })
-        .collect();
-    let mut by_id = HashMap::with_capacity(result.requests.len());
-    for PrefillRequestResult {
-        request_id,
-        first_token,
-        first_token_logprob,
-    } in &result.requests
-    {
-        anyhow::ensure!(
-            expected.contains(request_id),
-            "Qwen3.5 TP prefill returned unknown or non-final request id {}",
-            request_id.get()
-        );
-        let artifact = PrefillArtifact {
-            token: *first_token,
-            logprob: first_token_logprob.clone(),
-        };
-        anyhow::ensure!(
-            by_id.insert(*request_id, artifact).is_none(),
-            "Qwen3.5 TP prefill returned duplicate request id {}",
-            request_id.get()
-        );
-    }
-    anyhow::ensure!(
-        by_id.len() == expected.len(),
-        "Qwen3.5 TP prefill result is missing final request IDs"
-    );
-
-    request_ids
-        .iter()
-        .zip(&chunk.reqs)
-        .zip(&chunk.ends)
-        .map(|((&request_id, req), &end)| {
-            if end == req.prompt_tokens.len() {
-                by_id.remove(&request_id).map(Some).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Qwen3.5 TP prefill result is missing final request id {}",
-                        request_id.get()
-                    )
-                })
-            } else {
-                Ok(None)
-            }
-        })
-        .collect()
-}
-
-fn align_decode_results(
-    active: &[ActiveRequest35],
-    result: &DecodeResult,
-) -> Result<Vec<DecodeArtifact>> {
-    let expected: Vec<RequestId> = active
-        .iter()
-        .map(|active_req| {
-            let ActiveBackendState::Tp { request_id } = active_req.backend_state else {
-                anyhow::bail!("align_decode_results requires TP active state");
-            };
-            Ok(request_id)
-        })
-        .collect::<Result<_>>()?;
-    let expected_set: HashSet<_> = expected.iter().copied().collect();
-    anyhow::ensure!(
-        expected_set.len() == expected.len(),
-        "Qwen3.5 TP active decode IDs contain duplicates"
-    );
-    let mut by_id = HashMap::with_capacity(result.requests.len());
-    for DecodeRequestResult {
-        request_id,
-        token,
-        logprob,
-    } in &result.requests
-    {
-        anyhow::ensure!(
-            expected_set.contains(request_id),
-            "Qwen3.5 TP decode returned unknown request id {}",
-            request_id.get()
-        );
-        let artifact = DecodeArtifact {
-            token: *token,
-            logprob: logprob.clone(),
-        };
-        anyhow::ensure!(
-            by_id.insert(*request_id, artifact).is_none(),
-            "Qwen3.5 TP decode returned duplicate request id {}",
-            request_id.get()
-        );
-    }
-    expected
-        .into_iter()
-        .map(|request_id| {
-            by_id.remove(&request_id).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Qwen3.5 TP decode result is missing request id {}",
-                    request_id.get()
-                )
-            })
-        })
-        .collect()
-}
-
-fn split_decode_artifacts(artifacts: &[DecodeArtifact]) -> (Vec<u32>, Vec<Option<TokenLogprob>>) {
-    artifacts
-        .iter()
-        .map(|artifact| (artifact.token, artifact.logprob.clone()))
-        .unzip()
 }
 
 fn servable_len(max_context: usize, max_pages: usize, page_size: usize) -> u32 {
@@ -1360,15 +650,16 @@ where
     Ok(())
 }
 
-const UNSUPPORTED_ECHO_MESSAGE: &str = "echo=true is unsupported by the Qwen3.5 serving contract";
+const UNSUPPORTED_PROMPT_LOGPROBS_MESSAGE: &str =
+    "prompt_logprobs is unsupported by the Qwen3.5 serving contract";
 
-fn reject_unsupported_echo(pending: &mut Vec<SchedulerRequest>) {
+fn reject_unsupported_prompt_logprobs(pending: &mut Vec<SchedulerRequest>) {
     pending.retain(|req| {
-        if !req.echo {
+        if req.prompt_logprobs.is_none() {
             return true;
         }
         let _ = req.token_tx.send(TokenEvent::Rejected {
-            message: UNSUPPORTED_ECHO_MESSAGE.to_string(),
+            message: UNSUPPORTED_PROMPT_LOGPROBS_MESSAGE.to_string(),
             prompt_tokens: req.prompt_tokens.len(),
             completion_tokens: 0,
         });
@@ -1391,6 +682,10 @@ fn scheduler_loop(
     let mut prefilling: Vec<PrefillingRequest35> = Vec::new();
     let mut inflight_prefill: Option<InflightPrefill> = None;
     let max_batch = backend.max_batch();
+    let decode_overlap = matches!(
+        &backend,
+        SchedulerBackend::Single(single) if single.overlap_enabled()
+    );
 
     info!("scheduler ready (max_batch={})", max_batch);
 
@@ -1466,7 +761,7 @@ fn scheduler_loop(
             );
             return;
         }
-        reject_unsupported_echo(&mut pending);
+        reject_unsupported_prompt_logprobs(&mut pending);
 
         // 3. Publish the settled post-prune state. Requests accepted from the
         // channel are waiting until admission below; closed requests never
@@ -1516,7 +811,7 @@ fn scheduler_loop(
                 );
                 return;
             }
-            reject_unsupported_echo(&mut pending);
+            reject_unsupported_prompt_logprobs(&mut pending);
             publish_load(&load_tx, &backend, &active, &prefilling, 0, pending.len());
             if pending.is_empty() {
                 continue;
@@ -1666,6 +961,7 @@ fn scheduler_loop(
             prefill_budget,
             &active_decode,
             &prefill_queue,
+            decode_overlap,
         );
         let scheduled = take_prefill_chunks(&mut prefilling, step_prefill_budget);
         // ITL diagnostics (#470): capture the *actual* prefill-chunk token count
@@ -1678,9 +974,7 @@ fn scheduler_loop(
         let plan = plan::build_next_plan(!active.is_empty(), scheduled);
         if let Some(plan) = plan {
             let itl_plan_kind = match &plan {
-                ExecutionPlan::Unified { .. } if matches!(&backend, SchedulerBackend::Single(single) if single.overlap_enabled()) => {
-                    "overlap_launch"
-                }
+                ExecutionPlan::Unified { .. } if decode_overlap => "overlap_launch",
                 ExecutionPlan::Unified { .. } => "unified",
                 ExecutionPlan::Prefill { .. } => "prefill",
                 ExecutionPlan::Decode => "decode",
@@ -1688,8 +982,7 @@ fn scheduler_loop(
             let itl_step_start = itl_debug.then(Instant::now);
             let step_result = match plan {
                 ExecutionPlan::Unified { pending } => {
-                    if matches!(&backend, SchedulerBackend::Single(single) if single.overlap_enabled())
-                    {
+                    if decode_overlap {
                         launch_overlap_step(
                             &mut backend,
                             &mut active,
@@ -2208,15 +1501,20 @@ impl DecodeDispatchBackend for SchedulerBackend {
     ) -> ActiveRequest35 {
         match self {
             SchedulerBackend::Single(backend) => compact_single_slot(backend, active, idx),
-            SchedulerBackend::Tp(_) => active.swap_remove(idx),
+            SchedulerBackend::Tp(backend) => backend.take_active_request(active, idx),
         }
     }
 
     fn drop_active_state(&mut self, state: &ActiveBackendState) -> Result<()> {
         match (self, state) {
             (SchedulerBackend::Single(_), ActiveBackendState::Single { .. }) => Ok(()),
-            (SchedulerBackend::Tp(backend), ActiveBackendState::Tp { request_id }) => {
-                backend.drop_request(*request_id, DropExpectation::MustExist)
+            (SchedulerBackend::Tp(backend), ActiveBackendState::Tp { request_id, .. }) => {
+                let compaction = backend.pending_compaction.take();
+                backend.executor.drop_request_with_compaction(
+                    *request_id,
+                    DropExpectation::MustExist,
+                    compaction,
+                )
             }
             _ => anyhow::bail!("mismatched Qwen3.5 scheduler backend state during retirement"),
         }
@@ -2571,19 +1869,16 @@ impl PrefillPromoteBackend for SchedulerBackend {
         state: PrefillBackendState,
     ) -> ActiveBackendState {
         match (self, state) {
-            (SchedulerBackend::Single(single), PrefillBackendState::Single { kv, rec }) => {
-                let slot_idx = slot_for_new_request(active_len, single.max_batch())
-                    .expect("admission must reserve a graph slot");
-                single
-                    .copy_recurrent_to_slot(&rec, slot_idx)
-                    .expect("copy recurrent state to slot failed");
-                ActiveBackendState::Single {
-                    kv,
-                    graph_slot_idx: slot_idx,
-                }
+            (SchedulerBackend::Single(single), state @ PrefillBackendState::Single { .. }) => {
+                single.promote_prefill_state(active_len, state)
             }
-            (SchedulerBackend::Tp(_), PrefillBackendState::Tp { request_id }) => {
-                ActiveBackendState::Tp { request_id }
+            (SchedulerBackend::Tp(backend), PrefillBackendState::Tp { request_id }) => {
+                let slot_idx = slot_for_new_request(active_len, backend.max_batch())
+                    .expect("admission must reserve a TP decode slot");
+                ActiveBackendState::Tp {
+                    request_id,
+                    slot_idx,
+                }
             }
             _ => panic!("mismatched Qwen3.5 scheduler backend state during promotion"),
         }

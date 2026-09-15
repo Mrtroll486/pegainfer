@@ -13,7 +13,7 @@ Every model line is behind a cargo feature; only `qwen3` is a default feature, s
 | Qwen3-4B / 8B | `pegainfer-qwen3` | `qwen3` (default) | Full attention, TP support |
 | Qwen3.5-4B / 9B / 27B | `pegainfer-qwen35` | `--features qwen35` (needs build-time Python + Triton) | Hybrid Gated DeltaNet + full attention |
 | DeepSeek-V2-Lite | `pegainfer-deepseek-v2-lite` | `--features deepseek-v2-lite` | MoE + EP, 2-GPU |
-| Gemma 4 | `pegainfer-gemma4` | `--features gemma4` | Sliding-window + global full attention, single-GPU eager (bring-up) |
+| Gemma 4 | `pegainfer-gemma4` | `--features gemma4` | Sliding-window + global full attention, single GPU, batched decode, opt-in chunked prefill |
 | Kimi-K2 | `pegainfer-kimi-k2` | `--features kimi-k2` | MLA + MoE + Marlin INT4, 8-GPU EP |
 | GLM5.2 | `pegainfer-glm52` | `--features glm52` | MLA + MoE + FP8, 8-GPU EP (bring-up) |
 | Kimi-K3 | `pegainfer-k3` | `--features k3` | Hybrid KDA + MLA, latent MoE + MXFP4, EP (bring-up — single-rank decode wired) |
@@ -44,7 +44,10 @@ cargo run --release --features glm52 -- --model-path models/GLM5.2
 - `PEGAINFER_TEST_MODEL_PATH` — override test model path (default: `models/Qwen3-4B`)
 - `PEGAINFER_BUILD_TIMING=1` — print per-phase build timings (nvcc, Triton AOT, etc.)
 - `PEGAINFER_NVCC_JOBS` — override parallel nvcc job count
+- `PEGAINFER_GEMM_LT_CACHE` — opt-in cross-process cublasLt algo store: `<file>` carries the winners `gemm_lt_tune` timed in an earlier boot instead of re-timing them (Qwen3-4B on one sm_89 card: warm ready ~1965 → ~1312 ms, paired 5/5). Append-only text, created if absent, safe to share between processes and machines and safe to delete; each record carries GPU, CUDA runtime/driver/cublasLt version, shape and workspace cap, so anything that does not match is a miss and re-tunes (a driver update that keeps the same CUDA level is not distinguished — delete the file to force a re-tune). Unset = tune on every boot; Qwen3's `--batch-invariant` pins the heuristic instead and never reads it
+- `PEGAINFER_KV_FP8` — gemma4 opt-in fp8 KV: `local` stores the sliding family's K/V as e4m3 at scale 1.0 (lossy; halves the local pool; refuses an enabled prefix cache; unset = byte-identical serving)
 - `PEGAINFER_PREFIX_CACHE` — gemma4 opt-in conversation prefix cache: `K` entries of captured prompt state resume multi-turn prompts (pre-allocated page budget; unset = off, byte-identical serving)
+- `PEGAINFER_ADMIT_COALESCE_MS` — gemma4 opt-in admission coalesce door: `N` ms in `1..=2000` (`off`/`0`/unset = admit on sight), holds arrivals that would invade a live decode batch so a window's arrivals land as one admission burst; refuses the async prefill lane; merging into one mixed step needs the chunked walk or a sub-budget prompt
 - `PEGAINFER_ASYNC_PREFILL` — gemma4 opt-in overlap lane: `green:NN` prefills live-batch admissions on an SM-capped stream to protect decode tails (`shared` for comparison; unset = off; bad values refuse to start)
 - `PEGAINFER_MIX_CHUNK_TOKENS` — gemma4 opt-in chunked walk: a mixed admission computes at most `N` prompt rows per step (`64 <= N <` the serving ceiling; unset = whole-prompt steps; bad values refuse to start)
 - `PEGAINFER_MAX_CONTEXT` — gemma4 serving ceiling raise (default 8192, up to the checkpoint's 262144; a raise past the default needs `PEGAINFER_MIX_CHUNK_TOKENS` and refuses the async lane)
@@ -104,6 +107,15 @@ HTTP Request → vLLM frontend → EngineHandle → per-model scheduler/executor
 **Build system**: the virtual workspace root has no package build script. `pegainfer-kernels/build.rs` owns CUDA/Triton compilation:
 1. Compiles `pegainfer-kernels/csrc/*.cu` with nvcc (auto-detects GPU SM targets)
 2. Feature-gated codegen: `qwen35` runs Triton AOT via `pegainfer-kernels/tools/triton/gen_triton_aot.py`; `kimi-k2` adds MLA/MoE/Marlin CUDA; `glm52` adds MLA/MoE/FP8 CUDA plus TileLang sparse-MLA codegen on sm_90a
+
+## EP Free-Running Discipline
+
+Canonical doc: `docs/models/glm52/free-running-dp.md` (K3's gang lane follows it). Invariants — violating any of these is a deadlock design:
+
+- **No rank ever stops or waits.** Every engine loop runs unconditionally at full speed; idle ranks step with padding rows. Any quiet wait (condvar, sleep-poll) inside EP coordination is a bug, and the fleet is never asleep, so never design "wake up" or "pump until X" steps.
+- **The per-step collective chain is fixed** — no conditional collectives. Skipping work happens inside kernels via zero-load padding entry, never by host negotiation.
+- **The launch count is the global clock** (pairing pins all ranks within ±1 launch). Coordination means agreeing ahead of time on *what step N contains*, never "wait until everyone is ready".
+- **Padding rows are protocol surface**: their bytes reach peers, so every dummy-row input must be constructively deterministic.
 
 ---
 

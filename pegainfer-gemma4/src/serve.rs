@@ -19,6 +19,7 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use pegainfer_core::cuda_graph::CudaGraphState;
 use pegainfer_core::kv_pool::KvPool;
+use pegainfer_core::kv_pool::KvStorage;
 use pegainfer_core::ops;
 use pegainfer_core::ops::PrefillPagedPlan;
 use pegainfer_core::rope::RopeTableSpec;
@@ -313,6 +314,11 @@ fn copy_pool_pages(
     dst: &[i32],
 ) -> Result<()> {
     use cudarc::driver::DevicePtr;
+    // Page copies index bf16 elements, so only a bf16 pool may reach them.
+    anyhow::ensure!(
+        layout.storage == KvStorage::Bf16,
+        "pool page copies index bf16 elements; the fp8 pool must not reach them"
+    );
     anyhow::ensure!(
         src.len() == dst.len(),
         "page copy list mismatch: {} src vs {} dst",
@@ -468,8 +474,8 @@ impl TowerScratch {
     }
 }
 
-fn bucket_slot(bucket: usize) -> usize {
-    bucket.trailing_zeros() as usize
+pub(crate) fn decode_bucket_slot(rows: usize) -> usize {
+    rows.next_power_of_two().trailing_zeros() as usize
 }
 
 fn hidden_pair(hidden: &mut [HiddenStates; 2], src: usize) -> (&HiddenStates, &mut HiddenStates) {
@@ -482,6 +488,34 @@ fn hidden_pair(hidden: &mut [HiddenStates; 2], src: usize) -> (&HiddenStates, &m
 }
 
 const GLOBAL_SPLIT_CHUNK_TOKENS: usize = 256;
+
+struct SteadyDecode {
+    padded: usize,
+    rows: Vec<SteadyRow>,
+}
+
+#[derive(Eq, PartialEq)]
+struct SteadyRow {
+    kv_len: usize,
+    local_origin: usize,
+    local_pages: usize,
+    global_pages: usize,
+    global_chunks: usize,
+}
+
+impl SteadyDecode {
+    fn advances_to(&self, next: &Self) -> bool {
+        self.padded == next.padded
+            && self.rows.len() == next.rows.len()
+            && self.rows.iter().zip(&next.rows).all(|(current, next)| {
+                next.kv_len == current.kv_len + 1
+                    && next.local_origin == current.local_origin
+                    && next.local_pages == current.local_pages
+                    && next.global_pages == current.global_pages
+                    && next.global_chunks == current.global_chunks
+            })
+    }
+}
 
 /// The global family's decode tables, uploaded per step: the per-request
 /// half feeds the prep, the factor-repeated half feeds the split-KV
@@ -514,6 +548,92 @@ struct SplitKvState {
     cap: usize,
 }
 
+struct SplitKvSpec {
+    label: &'static str,
+    slots: usize,
+    rows: usize,
+    heads: usize,
+    head_dim: usize,
+    cap: usize,
+    chunk_size_d: CudaSlice<i32>,
+}
+
+struct SplitKvLaunch<'a> {
+    metadata: ops::Hd512DecodeMetadata<'a>,
+    o_indptr_d: &'a CudaSlice<i32>,
+    valid_mask_d: &'a CudaSlice<u8>,
+    tmp_v: &'a mut CudaSlice<bf16>,
+    tmp_s: &'a mut CudaSlice<f32>,
+    cap: usize,
+}
+
+impl SplitKvState {
+    fn new(ctx: &DeviceContext, spec: SplitKvSpec) -> Result<Self> {
+        let label = spec.label;
+        let alloc = |what: &'static str| {
+            move |err| anyhow::anyhow!("{label} split {what} alloc failed: {err}")
+        };
+        Ok(Self {
+            request_indices_d: ctx
+                .stream
+                .alloc_zeros(spec.slots)
+                .map_err(alloc("request indices"))?,
+            kv_tile_indices_d: ctx
+                .stream
+                .alloc_zeros(spec.slots)
+                .map_err(alloc("tile indices"))?,
+            chunk_size_d: spec.chunk_size_d,
+            o_indptr_d: ctx
+                .stream
+                .alloc_zeros(spec.rows + 1)
+                .map_err(alloc("o_indptr"))?,
+            valid_mask_d: ctx
+                .stream
+                .alloc_zeros(spec.slots)
+                .map_err(alloc("valid mask"))?,
+            tmp_v: ctx
+                .stream
+                .alloc_zeros(spec.slots * spec.heads * spec.head_dim)
+                .map_err(alloc("tmp_v"))?,
+            tmp_s: ctx
+                .stream
+                .alloc_zeros(spec.slots * spec.heads)
+                .map_err(alloc("tmp_s"))?,
+            cap: spec.cap,
+        })
+    }
+
+    fn upload_csr(&mut self, ctx: &DeviceContext, csr: &ops::SplitKvCsr) -> Result<()> {
+        upload_prefix(ctx, &mut self.request_indices_d, &csr.request_indices)?;
+        upload_prefix(ctx, &mut self.kv_tile_indices_d, &csr.kv_tile_indices)?;
+        upload_prefix(ctx, &mut self.o_indptr_d, &csr.o_indptr)?;
+        upload_prefix(ctx, &mut self.valid_mask_d, &csr.block_valid_mask)
+    }
+
+    fn metadata<'a>(
+        &'a mut self,
+        page_indices: &'a CudaSlice<i32>,
+        page_indptr: &'a CudaSlice<i32>,
+        last_page_len: &'a CudaSlice<i32>,
+    ) -> SplitKvLaunch<'a> {
+        SplitKvLaunch {
+            metadata: ops::Hd512DecodeMetadata::new(
+                page_indices,
+                page_indptr,
+                last_page_len,
+                &self.request_indices_d,
+                &self.kv_tile_indices_d,
+                &self.chunk_size_d,
+            ),
+            o_indptr_d: &self.o_indptr_d,
+            valid_mask_d: &self.valid_mask_d,
+            tmp_v: &mut self.tmp_v,
+            tmp_s: &mut self.tmp_s,
+            cap: self.cap,
+        }
+    }
+}
+
 /// The host buffers a split-KV pseudo expansion fills, borrowed apart so one
 /// builder serves every step shape.
 struct PseudoTables<'a> {
@@ -529,6 +649,7 @@ pub(crate) struct StepArena {
     local_plan: PrefillPagedPlan,
     global_tables: GlobalTables,
     global_split: SplitKvState,
+    steady: Option<SteadyDecode>,
     local_origins: CudaSlice<i32>,
     ids: CudaSlice<u32>,
     /// Mixed-step per-row prep metadata at step-stable pointers, covering
@@ -575,6 +696,15 @@ impl StepArena {
         );
         self.tower.open(rows)
     }
+
+    /// Logits and the id buffer consumed by the next decode embedding.
+    pub(crate) fn logits_and_ids(&mut self) -> (&mut HiddenStates, &mut CudaSlice<u32>) {
+        (&mut self.logits, &mut self.ids)
+    }
+
+    pub(crate) fn invalidate_decode_fingerprint(&mut self) {
+        self.steady = None;
+    }
 }
 
 /// How many pseudo-requests the global decode read presents each request
@@ -618,8 +748,6 @@ pub(crate) struct GemmaServe {
     sliding_window: usize,
     global_split_factor: usize,
     final_logit_softcapping: f32,
-    #[cfg(test)]
-    release_enabled: bool,
     sliding_cos: DeviceVec,
     sliding_sin: DeviceVec,
     global_cos: DeviceVec,
@@ -671,6 +799,7 @@ impl GemmaServe {
         ctx: &DeviceContext,
         weights: Gemma4Weights,
         max_context: usize,
+        local_kv_storage: KvStorage,
         local_pages: usize,
         global_pages: usize,
     ) -> Result<Self> {
@@ -701,13 +830,14 @@ impl GemmaServe {
                 }
             })
             .collect();
-        let local_pool = KvPool::new(
+        let local_pool = KvPool::with_storage(
             ctx,
             locals,
             config.num_key_value_heads,
             config.head_dim,
             PAGE_SIZE,
             local_pages,
+            local_kv_storage,
         )?;
         let global_pool = KvPool::new(
             ctx,
@@ -746,8 +876,6 @@ impl GemmaServe {
             sliding_window,
             global_split_factor,
             final_logit_softcapping,
-            #[cfg(test)]
-            release_enabled: true,
             sliding_cos,
             sliding_sin,
             global_cos,
@@ -841,36 +969,19 @@ impl GemmaServe {
                     .alloc_zeros(factor * max_rows)
                     .map_err(alloc("global pseudo last-page lens"))?,
             },
-            global_split: SplitKvState {
-                request_indices_d: ctx
-                    .stream
-                    .alloc_zeros(global_split_slots)
-                    .map_err(alloc("global split request indices"))?,
-                kv_tile_indices_d: ctx
-                    .stream
-                    .alloc_zeros(global_split_slots)
-                    .map_err(alloc("global split tile indices"))?,
-                chunk_size_d: global_chunk,
-                o_indptr_d: ctx
-                    .stream
-                    .alloc_zeros(factor * max_rows + 1)
-                    .map_err(alloc("global split o_indptr"))?,
-                valid_mask_d: ctx
-                    .stream
-                    .alloc_zeros(global_split_slots)
-                    .map_err(alloc("global split valid mask"))?,
-                tmp_v: ctx
-                    .stream
-                    .alloc_zeros(
-                        global_split_slots * global_split_heads * self.global_geom.head_dim,
-                    )
-                    .map_err(alloc("global split tmp_v"))?,
-                tmp_s: ctx
-                    .stream
-                    .alloc_zeros(global_split_slots * global_split_heads)
-                    .map_err(alloc("global split tmp_s"))?,
-                cap: global_split_cap,
-            },
+            global_split: SplitKvState::new(
+                ctx,
+                SplitKvSpec {
+                    label: "global",
+                    slots: global_split_slots,
+                    rows: factor * max_rows,
+                    heads: global_split_heads,
+                    head_dim: self.global_geom.head_dim,
+                    cap: global_split_cap,
+                    chunk_size_d: global_chunk,
+                },
+            )?,
+            steady: None,
             local_origins: ctx.stream.alloc_zeros(max_rows).map_err(alloc("origins"))?,
             ids: ctx.stream.alloc_zeros(max_rows).map_err(alloc("ids"))?,
             mix_positions: ctx
@@ -896,7 +1007,7 @@ impl GemmaServe {
             mix_indptr,
             head_normed: HiddenStates::zeros(ctx, self.local_geom.hidden_size, max_rows)?,
             logits: HiddenStates::zeros(ctx, self.weights.embed_tokens.rows, max_rows)?,
-            graphs: (0..=bucket_slot(max_rows))
+            graphs: (0..=decode_bucket_slot(max_rows))
                 .map(|_| CudaGraphState::new())
                 .collect(),
             graph_enabled,
@@ -1072,19 +1183,7 @@ impl GemmaServe {
         })
     }
 
-    /// The eviction gate runs the same request twice, once with the front
-    /// held resident, to show what release does and does not change.
-    #[cfg(test)]
-    pub(crate) fn set_release_for_test(&mut self, on: bool) {
-        self.release_enabled = on;
-    }
-
     fn advance_local(&self, kv: &mut GemmaKv, tokens: usize) -> Result<()> {
-        #[cfg(test)]
-        if !self.release_enabled {
-            kv.local.advance(tokens);
-            return Ok(());
-        }
         kv.local.advance_and_release(tokens, self.sliding_window)
     }
 
@@ -1465,13 +1564,10 @@ impl GemmaServe {
                 scratch.q_prep.seq_len = factor * seq_len;
                 scratch.attn.hidden_dim = q_dim / factor;
                 scratch.attn.seq_len = factor * seq_len;
-                let meta = ops::Hd512DecodeMetadata::new(
+                let launch = split.metadata(
                     &global_tables.pseudo_pages,
                     &global_tables.pseudo_indptr,
                     &global_tables.pseudo_last,
-                    &split.request_indices_d,
-                    &split.kv_tile_indices_d,
-                    &split.chunk_size_d,
                 );
                 ops::paged_attention_batch_decode_split_kv_hd512_into(
                     ctx,
@@ -1480,12 +1576,12 @@ impl GemmaServe {
                     self.global_pool.buffer(),
                     &self.global_pool.layout().kernel_layout(),
                     family_layer,
-                    &meta,
-                    &split.o_indptr_d,
-                    &split.valid_mask_d,
-                    &mut split.tmp_v,
-                    &mut split.tmp_s,
-                    factor * seq_len * split.cap,
+                    &launch.metadata,
+                    launch.o_indptr_d,
+                    launch.valid_mask_d,
+                    launch.tmp_v,
+                    launch.tmp_s,
+                    factor * seq_len * launch.cap,
                     &mut scratch.attn,
                     geom.num_q_heads / factor,
                     1.0,
@@ -1554,13 +1650,10 @@ impl GemmaServe {
                 scratch.q_prep.seq_len = factor * seq_len;
                 scratch.attn.hidden_dim = q_dim / factor;
                 scratch.attn.seq_len = factor * seq_len;
-                let meta = ops::Hd512DecodeMetadata::new(
+                let launch = split.metadata(
                     &global_tables.pseudo_pages,
                     &global_tables.pseudo_indptr,
                     &global_tables.pseudo_last,
-                    &split.request_indices_d,
-                    &split.kv_tile_indices_d,
-                    &split.chunk_size_d,
                 );
                 ops::paged_attention_batch_decode_split_kv_hd512_into(
                     ctx,
@@ -1569,12 +1662,12 @@ impl GemmaServe {
                     self.global_pool.buffer(),
                     &self.global_pool.layout().kernel_layout(),
                     family_layer,
-                    &meta,
-                    &split.o_indptr_d,
-                    &split.valid_mask_d,
-                    &mut split.tmp_v,
-                    &mut split.tmp_s,
-                    factor * batch * split.cap,
+                    &launch.metadata,
+                    launch.o_indptr_d,
+                    launch.valid_mask_d,
+                    launch.tmp_v,
+                    launch.tmp_s,
+                    factor * batch * launch.cap,
                     &mut scratch.attn,
                     geom.num_q_heads / factor,
                     1.0,
@@ -1628,19 +1721,39 @@ impl GemmaServe {
         upload_prefix(ctx, &mut global_tables.pseudo_pages, pages)?;
         upload_prefix(ctx, &mut global_tables.pseudo_indptr, indptr)?;
         upload_prefix(ctx, &mut global_tables.pseudo_last, last_lens)?;
-        upload_prefix(
-            ctx,
-            &mut global_split.request_indices_d,
-            &csr.request_indices,
-        )?;
-        upload_prefix(
-            ctx,
-            &mut global_split.kv_tile_indices_d,
-            &csr.kv_tile_indices,
-        )?;
-        upload_prefix(ctx, &mut global_split.o_indptr_d, &csr.o_indptr)?;
-        upload_prefix(ctx, &mut global_split.valid_mask_d, &csr.block_valid_mask)?;
-        Ok(())
+        global_split.upload_csr(ctx, &csr)
+    }
+
+    fn decode_fingerprint(&self, kvs: &[&mut GemmaKv], padded: usize) -> Option<SteadyDecode> {
+        let local_page = self.local_pool.layout().page_size;
+        let global_page = self.global_pool.layout().page_size;
+        let rows = kvs
+            .iter()
+            .map(|kv| {
+                let kv = &**kv;
+                let kv_len = kv.local.seq_len().checked_add(1)?;
+                let origin = kv.local.origin_pages();
+                let resident_len = kv_len.checked_sub(origin.checked_mul(local_page)?)?;
+                if resident_len == 0 {
+                    return None;
+                }
+                let local_pages = kv.local.held_pages();
+                let global_pages = kv.global.held_pages();
+                if local_pages != resident_len.div_ceil(local_page)
+                    || global_pages != kv_len.div_ceil(global_page)
+                {
+                    return None;
+                }
+                Some(SteadyRow {
+                    kv_len,
+                    local_origin: origin,
+                    local_pages,
+                    global_pages,
+                    global_chunks: kv_len.div_ceil(GLOBAL_SPLIT_CHUNK_TOKENS),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(SteadyDecode { padded, rows })
     }
 
     fn plan_decode_batch(
@@ -1651,6 +1764,20 @@ impl GemmaServe {
         padded: usize,
     ) -> Result<()> {
         let batch = kvs.len();
+        let fresh = self.decode_fingerprint(kvs, padded);
+        let regular = arena
+            .steady
+            .as_ref()
+            .zip(fresh.as_ref())
+            .is_some_and(|(current, next)| current.advances_to(next));
+        if regular {
+            for kv in kvs {
+                self.check_step_bounds(kv, kv.local.seq_len() + 1)?;
+            }
+            arena.steady = fresh;
+            return Ok(());
+        }
+        arena.steady = fresh;
         let StepArena {
             host,
             local_plan,
@@ -1812,6 +1939,27 @@ impl GemmaServe {
         kvs: &mut [&mut GemmaKv],
         tokens: &[u32],
     ) -> Result<&'a mut HiddenStates> {
+        self.decode_batch_step_inner(ctx, arena, kvs, Some(tokens))
+    }
+
+    /// Decode using token ids written into the arena by the prior staged
+    /// sampler. The caller keeps the row order and bucket unchanged.
+    pub(crate) fn decode_batch_step_resident<'a>(
+        &self,
+        ctx: &DeviceContext,
+        arena: &'a mut StepArena,
+        kvs: &mut [&mut GemmaKv],
+    ) -> Result<&'a mut HiddenStates> {
+        self.decode_batch_step_inner(ctx, arena, kvs, None)
+    }
+
+    fn decode_batch_step_inner<'a>(
+        &self,
+        ctx: &DeviceContext,
+        arena: &'a mut StepArena,
+        kvs: &mut [&mut GemmaKv],
+        tokens: Option<&[u32]>,
+    ) -> Result<&'a mut HiddenStates> {
         let batch = kvs.len();
         let padded = self.prepare_decode_step(ctx, arena, kvs, tokens)?;
         let StepArena {
@@ -1828,7 +1976,7 @@ impl GemmaServe {
             ..
         } = arena;
         if *graph_enabled {
-            let graph = &mut graphs[bucket_slot(padded)];
+            let graph = &mut graphs[decode_bucket_slot(padded)];
             anyhow::ensure!(
                 graph.is_captured(),
                 "no captured graph for bucket {padded}; the pre-capture sweep must cover \
@@ -1870,8 +2018,8 @@ impl GemmaServe {
         tower: &mut TowerScratch,
         ids: &CudaSlice<u32>,
         rows: usize,
-        local_plan: &PrefillPagedPlan,
-        global_tables: &GlobalTables,
+        local_plan: &mut PrefillPagedPlan,
+        global_tables: &mut GlobalTables,
         global_split: &mut SplitKvState,
         local_origins: &CudaSlice<i32>,
         head_normed: &mut HiddenStates,
@@ -1897,16 +2045,28 @@ impl GemmaServe {
             self.final_logit_softcapping,
             head_normed,
             logits,
+        )?;
+        let (local_last, kv_chunk) = local_plan.decode_metadata_d_mut();
+        ops::advance_decode_metadata(
+            ctx,
+            &mut global_tables.positions,
+            local_last,
+            &mut global_tables.pseudo_last,
+            kv_chunk,
+            rows,
+            self.global_split_factor,
         )
     }
 
-    /// One mixed step: a whole admitted prompt (rows `[0..prompt_len)`)
-    /// rides the same weight scan as the live decode batch (the row
-    /// suffix). Always eager — the prompt length varies per admission, so
-    /// this shape never rides a graph; the pure-decode steps around it keep
-    /// their bucketed replays. The returned logits hold `batch + 1` rows:
-    /// row 0 the prompt's next-token distribution, rows 1.. the decode
-    /// batch in order.
+    /// One mixed step: one or more admitted prefill entries — whole prompts,
+    /// or mid-walk segments under the chunk knob — ride the same weight scan
+    /// as the live decode batch (the row suffix), entry rows concatenated
+    /// first. Always eager — entry lengths vary per admission, so this shape
+    /// never rides a graph; the pure-decode steps around it keep their
+    /// bucketed replays. The returned logits hold `batch + entries` rows: one
+    /// distribution per prefill entry — a mid-walk segment's row is sampled
+    /// and discarded, and only the final segment supplies the request's
+    /// first pick — then the decode batch in order.
     pub(crate) fn mixed_prefill_decode_step<'a>(
         &self,
         ctx: &DeviceContext,
@@ -1935,6 +2095,7 @@ impl GemmaServe {
             arena.max_rows
         );
         self.check_stream(ctx)?;
+        arena.steady = None;
         for (_, prompt) in prefills.iter() {
             validate_tokens(&self.weights, self.local_geom.hidden_size, prompt)?;
         }
@@ -2165,22 +2326,24 @@ impl GemmaServe {
         ctx: &DeviceContext,
         arena: &mut StepArena,
         kvs: &[&mut GemmaKv],
-        tokens: &[u32],
+        tokens: Option<&[u32]>,
     ) -> Result<usize> {
         let batch = kvs.len();
         anyhow::ensure!(batch > 0, "a decode batch needs at least one request");
-        anyhow::ensure!(
-            tokens.len() == batch,
-            "decode batch has {batch} requests but {} tokens",
-            tokens.len()
-        );
         anyhow::ensure!(
             batch <= arena.max_rows,
             "decode batch of {batch} exceeds the arena's {} row ceiling",
             arena.max_rows
         );
         self.check_stream(ctx)?;
-        validate_tokens(&self.weights, self.local_geom.hidden_size, tokens)?;
+        if let Some(tokens) = tokens {
+            anyhow::ensure!(
+                tokens.len() == batch,
+                "decode batch has {batch} requests but {} tokens",
+                tokens.len()
+            );
+            validate_tokens(&self.weights, self.local_geom.hidden_size, tokens)?;
+        }
 
         // A step computes at its power-of-two bucket whether or not graphs
         // are on: padding is part of the numeric contract, which is what
@@ -2189,9 +2352,12 @@ impl GemmaServe {
         let padded = batch.next_power_of_two().max(arena.min_bucket);
         arena.open(ctx, padded)?;
         self.plan_decode_batch(ctx, arena, kvs, padded)?;
-        arena.host.ids.extend_from_slice(tokens);
-        arena.host.ids.resize(padded, 0);
-        upload_prefix(ctx, &mut arena.ids, &arena.host.ids)?;
+        if let Some(tokens) = tokens {
+            arena.host.ids.clear();
+            arena.host.ids.extend_from_slice(tokens);
+            arena.host.ids.resize(padded, 0);
+            upload_prefix(ctx, &mut arena.ids, &arena.host.ids)?;
+        }
         Ok(padded)
     }
 
@@ -2215,10 +2381,11 @@ impl GemmaServe {
         let mut bucket = 1usize;
         while bucket <= arena.max_rows {
             arena.min_bucket = bucket;
+            arena.steady = None;
             admit_tokens(&self.local_pool, &self.global_pool, &mut kv, 1)?;
             {
                 let mut kvs: [&mut GemmaKv; 1] = [&mut kv];
-                let padded = self.prepare_decode_step(ctx, arena, &kvs, &[0])?;
+                let padded = self.prepare_decode_step(ctx, arena, &kvs, Some(&[0]))?;
                 let StepArena {
                     tower,
                     local_plan,
@@ -2243,7 +2410,7 @@ impl GemmaServe {
                     head_normed,
                     logits,
                 )?;
-                graphs[bucket_slot(padded)].capture_only(ctx, || {
+                graphs[decode_bucket_slot(padded)].capture_only(ctx, || {
                     self.decode_gpu_body(
                         ctx,
                         tower,

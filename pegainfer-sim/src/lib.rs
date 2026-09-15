@@ -18,7 +18,6 @@ use pegainfer_frontend::engine::RequestLedger;
 use pegainfer_frontend::engine::Scheduler;
 use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_frontend::engine::SpecDecodeCounters;
-use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::spawn_scheduler;
 
 pub mod profile;
@@ -34,6 +33,8 @@ use worker::StepOutcome;
 use worker::SubmissionResult;
 use worker::WorkerRequest;
 use worker::WorkerState;
+
+mod logprobs;
 
 /// Cap on how long `step` parks while waiting for the next due token. New
 /// submissions only drain between steps, so a full TTFT/TPOT sleep would
@@ -203,7 +204,7 @@ struct RunningRequest {
     pending: Vec<u32>,
     next_token_at: Instant,
     finish_reason: FinishReason,
-    logprobs: usize,
+    logprobs: Option<usize>,
 }
 
 struct ProfiledRuntime {
@@ -217,7 +218,7 @@ struct ProfiledRuntime {
 struct ProfiledRequest {
     completion_tokens: Vec<u32>,
     finish_reason: FinishReason,
-    logprobs: usize,
+    logprobs: Option<usize>,
     prompt_echo: Option<PromptEcho>,
 }
 
@@ -337,10 +338,9 @@ impl ProfiledRuntime {
                             completion_tokens,
                             finish_reason,
                             logprobs: request.logprobs,
-                            prompt_echo: request.echo.then_some(PromptEcho {
-                                logprobs: vec![None; request.prompt_tokens.len()],
-                                ids: request.prompt_tokens,
-                            }),
+                            prompt_echo: request
+                                .prompt_logprobs
+                                .map(|top_k| logprobs::prompt(&request.prompt_tokens, top_k)),
                         },
                     );
                     ensure!(
@@ -349,16 +349,9 @@ impl ProfiledRuntime {
                     );
                 }
                 SubmissionResult::Finished => {
-                    let prompt_len = request.prompt_tokens.len();
                     ledger.admit(id);
-                    if request.echo {
-                        ledger.echo_prompt(
-                            id,
-                            PromptEcho {
-                                ids: request.prompt_tokens,
-                                logprobs: vec![None; prompt_len],
-                            },
-                        );
+                    if let Some(top_k) = request.prompt_logprobs {
+                        ledger.echo_prompt(id, logprobs::prompt(&request.prompt_tokens, top_k));
                     }
                     ledger.finish(id, finish_reason);
                 }
@@ -449,13 +442,12 @@ impl ProfiledRuntime {
                 .with_context(|| {
                     format!("missing token {token_index} for profiled request {request_id}")
                 })?;
-            let logprobs = if request.logprobs > 0 {
-                vec![Some(TokenLogprob {
-                    logprob: 0.0,
-                    top_logprobs: Vec::new(),
-                })]
-            } else {
-                Vec::new()
+            let logprob = request
+                .logprobs
+                .map(|top_k| logprobs::completion(token, top_k));
+            let logprobs = match logprob {
+                Some(logprob) => vec![Some(logprob)],
+                None => Vec::new(),
             };
             ledger.push_tokens(request_id, &[token], &logprobs);
         }
@@ -577,19 +569,13 @@ impl SimScheduler {
                 ledger.retire(id);
                 continue;
             }
-            if request.echo {
-                ledger.echo_prompt(
-                    id,
-                    PromptEcho {
-                        ids: request.prompt_tokens.clone(),
-                        logprobs: vec![None; request.prompt_tokens.len()],
-                    },
-                );
-            }
             let prompt_len = request.prompt_tokens.len();
             let (pending, finish_reason) =
                 planned_completion(&self.config, &request.prompt_tokens, request.max_tokens);
             ledger.admit(id);
+            if let Some(top_k) = request.prompt_logprobs {
+                ledger.echo_prompt(id, logprobs::prompt(&request.prompt_tokens, top_k));
+            }
             if pending.is_empty() {
                 ledger.finish(id, finish_reason);
                 continue;
@@ -618,10 +604,9 @@ impl SimScheduler {
                 ledger.finish(running.id, running.finish_reason);
                 continue;
             };
-            let logprob = (running.logprobs > 0).then_some(TokenLogprob {
-                logprob: 0.0,
-                top_logprobs: Vec::new(),
-            });
+            let logprob = running
+                .logprobs
+                .map(|top_k| logprobs::completion(token, top_k));
             let logprobs = match logprob {
                 Some(lp) => vec![Some(lp)],
                 None => Vec::new(),
@@ -729,8 +714,8 @@ mod tests {
             max_tokens,
             lora_adapter: None,
             kv_transfer_params: None,
-            logprobs,
-            echo: false,
+            logprobs: (logprobs > 0).then_some(logprobs),
+            prompt_logprobs: None,
             trace_parent: None,
             client_label: None,
         }

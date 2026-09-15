@@ -54,10 +54,10 @@ pub struct Request {
     /// Opaque router/P-D metadata from the request's
     /// `vllm_xargs.kv_transfer_params`.
     pub kv_transfer_params: Option<serde_json::Value>,
-    /// Number of top logprobs to return per token (0 = disabled).
-    pub logprobs: usize,
-    /// Return prompt tokens (and their logprobs) ahead of the completion.
-    pub echo: bool,
+    /// Completion top-k count: None disables scoring; Some(0) scores the chosen token.
+    pub logprobs: Option<usize>,
+    /// Prompt top-k count, independent of completion scoring; Some(0) scores each prompt token.
+    pub prompt_logprobs: Option<usize>,
     /// Trace context of the caller's request span, when tracing is on. The
     /// model scheduler opens its queue/prefill/decode spans as children of
     /// this. `None` when tracing is disabled.
@@ -126,7 +126,7 @@ impl RequestUpdate {
     }
 
     /// An update that carries no observable fact (possible when a request's
-    /// only activity this step was bookkeeping). The emitter drops these
+    /// only activity this step was bookkeeping). The ledger drops these
     /// rather than shipping empty records.
     pub(crate) fn is_vacant(&self) -> bool {
         self.scheduled.is_none()
@@ -186,6 +186,8 @@ pub enum RejectReason {
     },
     /// The named adapter is not loaded on this engine.
     UnknownLoraAdapter { name: String },
+    /// The request asks for a feature this engine does not implement.
+    Unsupported { feature: String },
 }
 
 impl fmt::Display for RejectReason {
@@ -227,12 +229,15 @@ impl fmt::Display for RejectReason {
             Self::UnknownLoraAdapter { name } => {
                 write!(f, "LoRA adapter is not loaded: {name}")
             }
+            Self::Unsupported { feature } => {
+                write!(f, "this engine does not support {feature}")
+            }
         }
     }
 }
 
 /// Why and how a request's lifetime ended. Token counts are tallied by the
-/// emitter from what actually shipped, not hand-maintained by model code.
+/// ledger from what actually shipped, not hand-maintained by model code.
 #[derive(Debug)]
 pub enum Terminal {
     Finished {
@@ -253,4 +258,20 @@ pub enum Terminal {
         prompt_tokens: usize,
         completion_tokens: usize,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_rejection_names_the_engine_feature() {
+        let reason = RejectReason::Unsupported {
+            feature: "frontend-resolved prefix".to_string(),
+        };
+        assert_eq!(
+            reason.to_string(),
+            "this engine does not support frontend-resolved prefix"
+        );
+    }
 }

@@ -24,16 +24,71 @@ use pegainfer_kernels::ops::gemma4_moe_router_topk_into;
 use pegainfer_kernels::ops::gemma4_moe_sum_topk_into;
 use pegainfer_kernels::ops::marlin_moe_align_block_size;
 
+use crate::config::MoeConfig;
 use crate::layer::LayerGeometry;
 use crate::weights::Gemma4Moe;
 
-/// The kernel's row block. Every expert's picks are padded up to it, so a
-/// narrower block wastes less on a thin step and a wider one launches fewer
-/// blocks; sixteen is the narrowest the kernel compiles a full table for.
-const BLOCK: usize = 16;
+// Decode's M tile; a thin step pads the least.
+const DECODE_BLOCK: usize = 16;
+// The `thread_m_blocks = 4` tile: one weight stripe serves four times the rows.
+const PREFILL_BLOCK: usize = 64;
+// A 1024-row step's routes: below it the coarse block loses first-token
+// time (measured down to 256 slots), at it the two blocks tie on a lone
+// prompt, and the mixed steps a busy server prefills through gain.
+const PREFILL_MIN_SLOTS: usize = 1024 * 8;
 
-/// Marlin's lock array is one int per 64-wide output tile per row block.
-const TILE_N: usize = 64;
+fn marlin_block(slots: usize) -> usize {
+    if slots >= PREFILL_MIN_SLOTS {
+        PREFILL_BLOCK
+    } else {
+        DECODE_BLOCK
+    }
+}
+
+// The shared launcher wants at most four lock words per SM and a non-null
+// fp32 staging buffer; Gemma's whole-column schedule reduces each output
+// element inside one CTA, so neither is ever written. The lock count covers
+// any device up to 1024 SMs.
+const MARLIN_LOCKS: usize = 4 * 1024;
+const MARLIN_STAGING_ELEMS: usize = 1024;
+
+struct MoeScratchSizes {
+    slots: usize,
+    blocks: usize,
+    padded: usize,
+}
+
+fn checked_mul(left: usize, right: usize, quantity: &str) -> Result<usize> {
+    left.checked_mul(right)
+        .ok_or_else(|| anyhow::anyhow!("Gemma 4: MoE scratch {quantity} overflows usize"))
+}
+
+fn checked_add(left: usize, right: usize, quantity: &str) -> Result<usize> {
+    left.checked_add(right)
+        .ok_or_else(|| anyhow::anyhow!("Gemma 4: MoE scratch {quantity} overflows usize"))
+}
+
+fn scratch_sizes(max_rows: usize, moe: &MoeConfig) -> Result<MoeScratchSizes> {
+    let slots = checked_mul(max_rows, moe.top_k, "routed slots")?;
+    let blocks = checked_add(
+        slots.div_ceil(DECODE_BLOCK),
+        moe.num_experts,
+        "expert blocks",
+    )?;
+    let narrow_padded = checked_mul(blocks, DECODE_BLOCK, "decode padded rows")?;
+    let padded = if slots >= PREFILL_MIN_SLOTS {
+        let expert_padding = checked_mul(moe.num_experts, PREFILL_BLOCK, "prefill expert padding")?;
+        let coarse_padded = checked_add(slots, expert_padding, "prefill padded rows")?;
+        narrow_padded.max(coarse_padded)
+    } else {
+        narrow_padded
+    };
+    Ok(MoeScratchSizes {
+        slots,
+        blocks,
+        padded,
+    })
+}
 
 /// Buffers one [`moe_into`] call needs, sized for the widest step the server
 /// admits.
@@ -54,8 +109,6 @@ pub(crate) struct MoeScratch {
     routed_act: HiddenStates,
     routed_down: HiddenStates,
     expert_out: HiddenStates,
-    dense_normed: HiddenStates,
-    expert_normed: HiddenStates,
     expert_offsets: CudaSlice<u32>,
     expert_cursor: CudaSlice<u32>,
 }
@@ -68,36 +121,26 @@ impl MoeScratch {
             .ok_or_else(|| anyhow::anyhow!("Gemma 4: no MoE scratch without a routed config"))?;
         let hidden = |rows| HiddenStates::zeros(ctx, geom.hidden_size, rows);
         let narrow = |rows| HiddenStates::zeros(ctx, moe.intermediate_size, rows);
-        let slots = max_rows * moe.top_k;
-        // Every expert can leave one block part filled, so the padded total
-        // runs past the slot count by that much in the worst case.
-        let max_blocks = slots.div_ceil(BLOCK) + moe.num_experts;
-        let max_padded = max_blocks * BLOCK;
+        let sizes = scratch_sizes(max_rows, moe)?;
         Ok(Self {
             max_rows,
             router_in: hidden(max_rows)?,
             logits: HiddenStates::zeros(ctx, moe.num_experts, max_rows)?,
-            index: ctx.stream.alloc_zeros::<i32>(slots)?,
-            weight: ctx.stream.alloc_zeros::<f32>(slots)?,
-            sorted_token_ids: ctx.stream.alloc_zeros::<i32>(max_padded)?,
-            expert_ids: ctx.stream.alloc_zeros::<i32>(max_blocks)?,
+            index: ctx.stream.alloc_zeros::<i32>(sizes.slots)?,
+            weight: ctx.stream.alloc_zeros::<f32>(sizes.slots)?,
+            sorted_token_ids: ctx.stream.alloc_zeros::<i32>(sizes.padded)?,
+            expert_ids: ctx.stream.alloc_zeros::<i32>(sizes.blocks)?,
             padded_total: ctx.stream.alloc_zeros::<i32>(1)?,
-            locks: ctx
-                .stream
-                .alloc_zeros::<i32>(geom.hidden_size / TILE_N * max_blocks)?,
-            c_tmp: ctx
-                .stream
-                .alloc_zeros::<f32>(geom.hidden_size * max_padded)?,
+            locks: ctx.stream.alloc_zeros::<i32>(MARLIN_LOCKS)?,
+            c_tmp: ctx.stream.alloc_zeros::<f32>(MARLIN_STAGING_ELEMS)?,
             moe_in: hidden(max_rows)?,
-            routed_gate: narrow(slots)?,
-            routed_up: narrow(slots)?,
-            routed_act: narrow(slots)?,
-            routed_down: hidden(slots)?,
+            routed_gate: narrow(sizes.slots)?,
+            routed_up: narrow(sizes.slots)?,
+            routed_act: narrow(sizes.slots)?,
+            routed_down: hidden(sizes.slots)?,
             expert_out: hidden(max_rows)?,
-            dense_normed: hidden(max_rows)?,
-            expert_normed: hidden(max_rows)?,
             expert_offsets: ctx.stream.alloc_zeros::<u32>(moe.num_experts + 1)?,
-            expert_cursor: ctx.stream.alloc_zeros::<u32>(moe.num_experts)?,
+            expert_cursor: ctx.stream.alloc_zeros::<u32>(1)?,
         })
     }
 
@@ -112,8 +155,6 @@ impl MoeScratch {
             &mut self.logits,
             &mut self.moe_in,
             &mut self.expert_out,
-            &mut self.dense_normed,
-            &mut self.expert_normed,
         ] {
             buf.seq_len = rows;
         }
@@ -168,19 +209,17 @@ pub(crate) fn moe_into(
         geom.hidden_size
     );
 
-    // The router's own norm carries no scale of its own, so the parameter
-    // multiply and the `hidden ** -0.5` that follow it are separate steps.
-    ops::rms_norm_batch_into(
+    // Both residual norms share one reduction. The router branch still
+    // rounds before its `hidden ** -0.5` scalar multiply.
+    ops::rms_norm_batch_dual_into(
         ctx,
         residual,
         &moe.router_scale,
+        &moe.pre_feedforward_layernorm_2,
         geom.rms_norm_eps,
-        &mut scratch.router_in,
-    );
-    ops::scale_bf16_in_place(
-        ctx,
-        &mut scratch.router_in,
         (geom.hidden_size as f32).powf(-0.5),
+        &mut scratch.router_in,
+        &mut scratch.moe_in,
     )?;
     ops::gemm_rows_into_checked(
         ctx,
@@ -200,13 +239,14 @@ pub(crate) fn moe_into(
     )?;
 
     let slots = rows * config.top_k;
+    let block = marlin_block(slots);
     marlin_moe_align_block_size(
         ctx,
         &scratch.index,
         rows,
         config.top_k,
         config.num_experts,
-        BLOCK,
+        block,
         &mut MoeAlignScratch {
             sorted_token_ids: &mut scratch.sorted_token_ids,
             expert_ids: &mut scratch.expert_ids,
@@ -216,20 +256,12 @@ pub(crate) fn moe_into(
         },
     )?;
 
-    ops::rms_norm_batch_into(
-        ctx,
-        residual,
-        &moe.pre_feedforward_layernorm_2,
-        geom.rms_norm_eps,
-        &mut scratch.moe_in,
-    );
-
     let gather = MarlinDispatch {
         sorted_token_ids: &scratch.sorted_token_ids,
         expert_ids: &scratch.expert_ids,
         num_tokens_post_padded: &scratch.padded_total,
         topk_weights: &scratch.weight,
-        block_size: BLOCK,
+        block_size: block,
         top_k: config.top_k,
         mul_topk_weights: false,
     };
@@ -296,21 +328,15 @@ pub(crate) fn moe_into(
         &mut scratch.expert_out,
     )?;
 
-    ops::rms_norm_batch_into(
+    ops::dual_rms_norm_add_batch_into(
         ctx,
         dense,
         &moe.post_feedforward_layernorm_1,
-        geom.rms_norm_eps,
-        &mut scratch.dense_normed,
-    );
-    ops::rms_norm_batch_into(
-        ctx,
         &scratch.expert_out,
         &moe.post_feedforward_layernorm_2,
         geom.rms_norm_eps,
-        &mut scratch.expert_normed,
-    );
-    ops::add_batch_into(ctx, &scratch.dense_normed, &scratch.expert_normed, out)?;
+        out,
+    )?;
     Ok(())
 }
 

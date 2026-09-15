@@ -60,7 +60,9 @@ use crate::vllm::wire::convert_finish_reason;
 use crate::vllm::wire::convert_sampling;
 use crate::vllm::wire::lora_adapter_from_sampling_params;
 use crate::vllm::wire::requested_logprobs;
+use crate::vllm::wire::requested_prompt_logprobs;
 use crate::vllm::wire::to_wire_position_logprobs;
+use crate::vllm::wire::to_wire_prompt_logprobs;
 
 pub(crate) struct SteppedEngineBridge {
     pub(crate) input_address: String,
@@ -405,7 +407,7 @@ impl SteppedEngineBridge {
             lora_adapter,
             kv_transfer_params,
             logprobs: requested_logprobs(&sampling_params),
-            echo: false,
+            prompt_logprobs: requested_prompt_logprobs(&sampling_params),
             trace_parent,
             client_label: Some(Arc::from(request_id.as_str())),
         });
@@ -427,7 +429,9 @@ struct SteppedStream {
     /// Queued/Scheduled wire events, held until the request's first shipped
     /// output (a scheduled-only update ships nothing on its own).
     first_token_events: Option<Vec<EngineCoreEvent>>,
-    prompt_tokens: usize,
+    /// Set by `Scheduled`; a request refused or failed while still queued
+    /// never prefilled and reports no prefill stats.
+    prompt_tokens: Option<usize>,
     cached_tokens: usize,
     prefill_stats_sent: bool,
     /// P/D handoff metadata can arrive in an update with no token or
@@ -453,7 +457,7 @@ impl SteppedStream {
             request_id,
             control,
             first_token_events: None,
-            prompt_tokens: 0,
+            prompt_tokens: None,
             cached_tokens: 0,
             prefill_stats_sent: false,
             kv_transfer_params: None,
@@ -462,18 +466,35 @@ impl SteppedStream {
         }
     }
 
+    fn fail_prompt(&mut self, error: &anyhow::Error) -> (Option<EngineCoreOutput>, bool) {
+        warn!("request {} failed: {error:#}", self.request_id);
+        self.control.abort();
+        let output = engine_output(
+            self.request_id.clone(),
+            Vec::new(),
+            None,
+            Some(EngineCoreFinishReason::Error),
+            Some(StopReason::Text(error.to_string())),
+            self.first_token_events.take(),
+            self.take_prefill_stats(),
+        );
+        (Some(output), true)
+    }
+
     /// Prefill stats for the request's first shipped output. Built lazily so
     /// a `cached_tokens` fact arriving after `Scheduled` (chunked prefill
     /// reports it with the first chunk) still lands in the stats. Upstream
-    /// invariant: computed + cached == prompt.
+    /// invariant: computed + cached == prompt. `None` for a request that
+    /// never reached `Scheduled`.
     fn take_prefill_stats(&mut self) -> Option<PrefillStats> {
         if self.prefill_stats_sent {
             return None;
         }
+        let prompt_tokens = self.prompt_tokens?;
         self.prefill_stats_sent = true;
         Some(PrefillStats {
-            num_prompt_tokens: self.prompt_tokens as u32,
-            num_computed_tokens: self.prompt_tokens.saturating_sub(self.cached_tokens) as u32,
+            num_prompt_tokens: prompt_tokens as u32,
+            num_computed_tokens: prompt_tokens.saturating_sub(self.cached_tokens) as u32,
             num_cached_tokens: self.cached_tokens as u32,
             num_local_cached_tokens: self.cached_tokens as u32,
             num_external_cached_tokens: 0,
@@ -502,7 +523,7 @@ fn reduce_update(
                 timestamp: anchor.unix(scheduled.scheduled_at),
             },
         ]);
-        state.prompt_tokens = scheduled.prompt_tokens;
+        state.prompt_tokens = Some(scheduled.prompt_tokens);
     }
     if let Some(cached) = update.cached_tokens {
         state.cached_tokens = cached;
@@ -510,10 +531,10 @@ fn reduce_update(
     if let Some(params) = update.kv_transfer {
         state.kv_transfer_params = Some(params);
     }
-    // Prompt logprobs (update.prompt_echo) are dropped here: no vLLM-protocol
-    // consumer requests echo yet (the HTTP layer rejects `echo` + `prompt_logprobs`
-    // before submission), matching the legacy bridge. Wiring it up means mapping
-    // PromptEcho into EngineCoreOutput's prompt_logprobs fields.
+    let prompt_logprobs = match update.prompt_echo.map(to_wire_prompt_logprobs).transpose() {
+        Ok(payload) => payload.flatten(),
+        Err(error) => return state.fail_prompt(&error),
+    };
 
     let mut token_ids = update.tokens;
     let mut has_logprobs = false;
@@ -567,7 +588,7 @@ fn reduce_update(
         }
     }
 
-    if token_ids.is_empty() && !terminated {
+    if token_ids.is_empty() && prompt_logprobs.is_none() && !terminated {
         return (None, false);
     }
 
@@ -581,6 +602,7 @@ fn reduce_update(
         state.first_token_events.take(),
         state.take_prefill_stats(),
     );
+    output.new_prompt_logprobs_tensors = prompt_logprobs;
     output.kv_transfer_params = state.kv_transfer_params.take();
     (Some(output), terminated)
 }
@@ -607,5 +629,165 @@ impl UnixAnchor {
         } else {
             self.sys - (self.instant - t).as_secs_f64()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vllm_engine_core_client::protocol::output::EngineCoreOutputs;
+    use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
+
+    use super::*;
+    use crate::engine::PromptEcho;
+    use crate::engine::RejectReason;
+    use crate::engine::TokenLogprob;
+    use crate::engine::scheduler_pair;
+
+    fn request() -> Request {
+        Request {
+            prompt_tokens: vec![1, 2],
+            params: crate::sampler::SamplingParams::default(),
+            max_tokens: 1,
+            lora_adapter: None,
+            kv_transfer_params: None,
+            logprobs: None,
+            prompt_logprobs: None,
+            trace_parent: None,
+            client_label: None,
+        }
+    }
+
+    #[test]
+    fn unsupported_rejection_is_rendered_for_vllm() {
+        let (handle, _backend) = scheduler_pair();
+        let control = handle.submit(request());
+        let mut stream = SteppedStream::new("unsupported".into(), control, Span::noop(), None);
+        let mut update = RequestUpdate::empty(stream.control.id());
+        update.terminal = Some(Terminal::Rejected {
+            reason: RejectReason::Unsupported {
+                feature: "kv_transfer".into(),
+            },
+            prompt_tokens: 2,
+        });
+
+        let (output, terminated) = reduce_update(&mut stream, update, &UnixAnchor::now());
+        let output = output.expect("rejection produces a wire output");
+        assert!(terminated);
+        assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Error));
+        assert_eq!(
+            output.stop_reason,
+            Some(StopReason::Text(
+                "this engine does not support kv_transfer".into()
+            ))
+        );
+        assert!(
+            output.prefill_stats.is_none(),
+            "a request refused while queued did no prefill"
+        );
+    }
+
+    fn bridge(scheduler: SchedulerHandle) -> SteppedEngineBridge {
+        SteppedEngineBridge {
+            input_address: String::new(),
+            output_address: String::new(),
+            scheduler,
+            kv_capacity: None,
+            max_model_len: 128,
+            engine_index: 0,
+            data_parallel_size: 1,
+        }
+    }
+
+    fn wire_request(completion: Option<i32>, prompt: Option<i32>) -> EngineCoreRequest {
+        let mut params = EngineCoreSamplingParams::for_test();
+        params.logprobs = completion;
+        params.prompt_logprobs = prompt;
+        EngineCoreRequest {
+            request_id: "logprobs".into(),
+            prompt_token_ids: Some(vec![9, 8]),
+            sampling_params: Some(params),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn negative_engine_core_logprob_counts_are_rejected_before_submission() {
+        for (completion, prompt) in [(Some(-2), None), (None, Some(-2))] {
+            let (handle, backend) = scheduler_pair();
+            let bridge = bridge(handle);
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut streams = HashMap::new();
+            bridge
+                .start_request(
+                    wire_request(completion, prompt),
+                    &mut streams,
+                    &mut HashMap::new(),
+                    &tx,
+                )
+                .unwrap();
+            assert!(streams.is_empty());
+            assert!(backend.submissions.try_recv().is_err());
+            let EngineCoreOutputs::RequestBatch(batch) = rx.try_recv().unwrap() else {
+                panic!("expected a terminal request batch");
+            };
+            assert_eq!(batch.outputs.len(), 1);
+            assert_eq!(batch.outputs[0].request_id, "logprobs");
+            assert_eq!(
+                batch.outputs[0].finish_reason,
+                Some(EngineCoreFinishReason::Error)
+            );
+        }
+    }
+
+    fn prompt_update(id: RequestId, score: Option<TokenLogprob>) -> RequestUpdate {
+        let mut update = RequestUpdate::empty(id);
+        update.prompt_echo = Some(PromptEcho {
+            ids: vec![9, 8],
+            logprobs: vec![None, score],
+        });
+        update
+    }
+
+    #[test]
+    fn prompt_only_flushes_and_malformed_prompt_aborts_its_request() {
+        let (handle, mut backend) = scheduler_pair();
+        let bridge = bridge(handle);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut streams = HashMap::new();
+        bridge
+            .start_request(
+                wire_request(Some(0), Some(2)),
+                &mut streams,
+                &mut HashMap::new(),
+                &tx,
+            )
+            .unwrap();
+        let queued = backend
+            .ledger
+            .register(backend.submissions.try_recv().unwrap());
+        assert_eq!(queued.request.logprobs, Some(0));
+        assert_eq!(queued.request.prompt_logprobs, Some(2));
+        let state = streams.get_mut(&queued.id).unwrap();
+        let update = prompt_update(
+            queued.id,
+            Some(TokenLogprob {
+                rank: 1,
+                logprob: -0.5,
+                top_logprobs: Vec::new(),
+            }),
+        );
+        let (output, terminated) = reduce_update(state, update, &UnixAnchor::now());
+        assert!(!terminated);
+        let output = output.expect("prompt-only output must flush");
+        assert!(output.new_token_ids.is_empty());
+        assert!(output.new_prompt_logprobs_tensors.is_some());
+        let malformed = prompt_update(queued.id, None);
+        let (output, terminated) = reduce_update(state, malformed, &UnixAnchor::now());
+        assert!(terminated);
+        assert_eq!(
+            output.unwrap().finish_reason,
+            Some(EngineCoreFinishReason::Error)
+        );
+        assert!(backend.ledger.is_aborted(queued.id));
     }
 }

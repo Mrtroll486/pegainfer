@@ -24,11 +24,71 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    pub fn rms_norm_batched_dual_cuda(
+        x: *const Half,
+        weight_a: *const Half,
+        weight_b: *const Half,
+        out_a: *mut Half,
+        out_b: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        scale_a: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn dual_rms_norm_add_batched_cuda(
+        a: *const Half,
+        weight_a: *const Half,
+        b: *const Half,
+        weight_b: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn rms_norm_add_rms_norm_round_batched_cuda(
+        x: *const Half,
+        weight_post: *const Half,
+        res_in: *const Half,
+        weight_pre: *const Half,
+        residual_out: *mut Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn rms_norm_add_scale_batched_cuda(
+        x: *const Half,
+        weight: *const Half,
+        residual: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn add_cuda(
         a: *const Half,
         b: *const Half,
         out: *mut Half,
         n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn advance_decode_metadata_cuda(
+        positions: *mut i32,
+        local_last: *mut i32,
+        pseudo_last: *mut i32,
+        kv_chunk: *mut i32,
+        rows: i32,
+        factor: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -183,6 +243,7 @@ unsafe extern "C" {
         picked: *const i32,
         top_k: *const i32,
         out_picked_lp: *mut f32,
+        out_picked_rank: *mut i32,
         out_topk_vals: *mut f32,
         out_topk_ids: *mut i32,
         rows: i32,
@@ -321,6 +382,21 @@ unsafe extern "C" {
         K: i32,
         stream: CUstream,
     ) -> i32;
+
+    // The tuned-algo store's record format and file (csrc/shared/lt_algo_store.cu).
+    // `linear.cu` is the caller; declared here because the format and its recovery
+    // from a short write are what `tests/lt_algo_store.rs` exercises, and that
+    // half needs no GPU.
+    pub fn pegainfer_lt_store_lookup(
+        path: *const std::os::raw::c_char,
+        key: *const std::os::raw::c_char,
+        out: *mut u64,
+    ) -> i32;
+    pub fn pegainfer_lt_store_append(
+        path: *const std::os::raw::c_char,
+        key: *const std::os::raw::c_char,
+        words: *const u64,
+    );
 
     // Batch-invariant pinned-algo path (csrc/shared/linear.cu).
     pub fn gemm_lt_pin_tune_cuda(
@@ -871,6 +947,8 @@ unsafe extern "C" {
         bias: *const Half,
         block_size: i32,
         step: i32,
+        chains: i32,
+        req_map: *const i32,
         rows: i32,
         n: i32,
         partial_values: *mut f32,
@@ -878,7 +956,39 @@ unsafe extern "C" {
         out_tokens: *mut u32,
         sampled_tokens: *mut u32,
         stream: CUstream,
-    );
+    ) -> i32;
+
+    pub fn hedge_ladder_force_cuda(
+        prev: *mut u32,
+        sampled: *mut u32,
+        runners: *const u32,
+        req_map: *const i32,
+        n: i32,
+        c: i32,
+        j: i32,
+        runner_stride: i32,
+        block_size: i32,
+        step: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn markov_step_top2_cuda(
+        base: *const Half,
+        bias: *const Half,
+        block_size: i32,
+        step: i32,
+        chains: i32,
+        rows: i32,
+        n: i32,
+        partial_v1: *mut f32,
+        partial_i1: *mut i32,
+        partial_v2: *mut f32,
+        partial_i2: *mut i32,
+        out_tokens: *mut u32,
+        sampled_tokens: *mut u32,
+        out_top2: *mut u32,
+        stream: CUstream,
+    ) -> i32;
 
     pub fn bf16_to_f32_cuda(
         input: *const Half,
@@ -1129,6 +1239,65 @@ unsafe extern "C" {
     ) -> i32;
 
     pub fn qkv_norm_rope_paged_decode_hd256_plain_cuda(
+        q_batch: *const Half,
+        k_batch: *const Half,
+        v_batch: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        q_batch_out: *mut Half,
+        kv_data: *mut Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indices_len: i32,
+        page_indptr: *const i32,
+        page_origins: *const i32,
+        positions: *const i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        batch: i32,
+        cos_max_pos: i32,
+        rotary_dim: i32,
+        rms_eps: f32,
+        page_size: i32,
+        num_pages: i32,
+        stride_page: i64,
+        stream: CUstream,
+    ) -> i32;
+
+    /// E4m3 KV twin.
+    pub fn qkv_norm_rope_paged_prefill_hd256_plain_fp8kv_cuda(
+        q_batch: *const Half,
+        k_batch: *const Half,
+        v_batch: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        q_batch_out: *mut Half,
+        kv_data: *mut Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indices_len: i32,
+        page_origin: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        seq_len: i32,
+        start_pos: i32,
+        cos_max_pos: i32,
+        rotary_dim: i32,
+        rms_eps: f32,
+        page_size: i32,
+        num_pages: i32,
+        stride_page: i64,
+        stream: CUstream,
+    ) -> i32;
+
+    /// E4m3 KV twin.
+    pub fn qkv_norm_rope_paged_decode_hd256_plain_fp8kv_cuda(
         q_batch: *const Half,
         k_batch: *const Half,
         v_batch: *const Half,

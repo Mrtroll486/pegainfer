@@ -30,7 +30,7 @@ use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::sampler::SamplingParams;
 
 /// A contract request with test defaults; adjust fields on the result for
-/// echo/logprobs/LoRA variants.
+/// prompt-logprob/completion-logprob/LoRA variants.
 pub(crate) fn request(
     prompt_tokens: Vec<u32>,
     params: SamplingParams,
@@ -42,8 +42,8 @@ pub(crate) fn request(
         max_tokens,
         lora_adapter: None,
         kv_transfer_params: None,
-        logprobs: 0,
-        echo: false,
+        logprobs: None,
+        prompt_logprobs: None,
         trace_parent: None,
         client_label: None,
     }
@@ -248,4 +248,33 @@ pub(crate) struct Outcome {
     pub(crate) cached_tokens: Option<usize>,
     pub(crate) prompt_echo: Option<PromptEcho>,
     pub(crate) terminal: Terminal,
+}
+
+/// Minimal stderr logger for gate children (`PEGAINFER_TEST_LOG=1`): the
+/// hedged execution gate counts the executor's per-round hedge trace lines,
+/// and cargo test binaries install no logger of their own. Forwarding only
+/// this crate's records keeps child stderr parseable.
+struct TestLogger;
+
+impl log::Log for TestLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.target().starts_with("pegainfer_qwen3")
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static TEST_LOGGER: TestLogger = TestLogger;
+
+pub(crate) fn init_capture_logging() {
+    if std::env::var("PEGAINFER_TEST_LOG").is_ok() {
+        let _ = log::set_logger(&TEST_LOGGER);
+        log::set_max_level(log::LevelFilter::Debug);
+    }
 }

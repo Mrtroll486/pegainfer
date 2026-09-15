@@ -49,6 +49,53 @@ pub fn add_batch_into(
     Ok(())
 }
 
+/// Advance the per-row decode tables written by a regular graph replay.
+pub fn advance_decode_metadata(
+    ctx: &DeviceContext,
+    positions: &mut CudaSlice<i32>,
+    local_last: &mut CudaSlice<i32>,
+    pseudo_last: &mut CudaSlice<i32>,
+    kv_chunk: &mut CudaSlice<i32>,
+    rows: usize,
+    factor: usize,
+) -> Result<()> {
+    anyhow::ensure!(rows > 0, "advance_decode_metadata: rows must be positive");
+    anyhow::ensure!(
+        factor > 0,
+        "advance_decode_metadata: factor must be positive"
+    );
+    let pseudo_rows = rows
+        .checked_mul(factor)
+        .filter(|n| i32::try_from(*n).is_ok())
+        .ok_or_else(|| anyhow!("advance_decode_metadata: rows x factor exceeds i32"))?;
+    anyhow::ensure!(
+        positions.len() >= rows
+            && local_last.len() >= rows
+            && kv_chunk.len() >= rows
+            && pseudo_last.len() >= pseudo_rows,
+        "advance_decode_metadata: {rows} rows x {factor} exceeds a table"
+    );
+    let rows = super::checked_i32(rows, "advance decode metadata rows")?;
+    let factor = super::checked_i32(factor, "advance decode metadata factor")?;
+    let (positions_ptr, _positions_guard) = positions.device_ptr_mut(&ctx.stream);
+    let (local_ptr, _local_guard) = local_last.device_ptr_mut(&ctx.stream);
+    let (pseudo_ptr, _pseudo_guard) = pseudo_last.device_ptr_mut(&ctx.stream);
+    let (chunk_ptr, _chunk_guard) = kv_chunk.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::advance_decode_metadata_cuda(
+            positions_ptr as *mut i32,
+            local_ptr as *mut i32,
+            pseudo_ptr as *mut i32,
+            chunk_ptr as *mut i32,
+            rows,
+            factor,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result.result()?;
+    Ok(())
+}
+
 /// Element-wise add of `n` bf16 elements into a pre-allocated output
 /// (`out = a + b`). Slice-level twin of [`add_batch_into`] — same kernel —
 /// for callers whose buffers live in a persistent decode arena rather than
@@ -1139,6 +1186,47 @@ mod tests {
     use half::bf16;
 
     use super::*;
+
+    /// The suppression contract, beside the kernel that owns it: writes are
+    /// exactly the given ids, the upload refuses an id at the head's width,
+    /// and ids validated against a different head never reach these logits.
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn the_suppression_mask_writes_only_the_ids_it_is_given() {
+        let ctx = DeviceContext::new().expect("GPU required");
+        let (vocab, rows) = (8usize, 2usize);
+        let mut logits = HiddenStates::zeros(&ctx, vocab, rows).expect("logits");
+        let suppress_ids = SuppressIds::upload(&ctx, &[3u32, 5], vocab).expect("ids");
+        suppress_logits_bf16_in_place(&ctx, &mut logits, &suppress_ids).expect("suppress");
+
+        let host = logits.to_host(&ctx).expect("D2H");
+        for row in 0..rows {
+            for id in 0..vocab {
+                let value = host[row * vocab + id];
+                if id == 3 || id == 5 {
+                    assert!(
+                        value == f32::NEG_INFINITY,
+                        "row {row} id {id} is {value}, not suppressed"
+                    );
+                } else {
+                    assert!(value == 0.0, "row {row} id {id} moved to {value}");
+                }
+            }
+        }
+
+        // The bound is structural: an id the head does not span cannot reach
+        // the kernel, and neither can ids checked against a different head.
+        let past_the_head = SuppressIds::upload(&ctx, &[vocab as u32], vocab);
+        assert!(
+            past_the_head.is_err(),
+            "an id at the head's width must be refused at upload"
+        );
+        let other_head = SuppressIds::upload(&ctx, &[1u32], vocab + 1).expect("ids");
+        assert!(
+            suppress_logits_bf16_in_place(&ctx, &mut logits, &other_head).is_err(),
+            "ids checked against a wider head must not be applied to these logits"
+        );
+    }
 
     fn hidden_from_host(
         ctx: &DeviceContext,
