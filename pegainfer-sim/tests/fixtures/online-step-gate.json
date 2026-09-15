@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "profile_id": "online-step-gate",
+  "provenance": {
+    "target_engine": "vllm",
+    "engine_version": "fixture",
+    "model_id": "pegainfer-sim-online-gate",
+    "model_revision": "fixture-revision",
+    "model_config_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "gpu": "fixture-cpu",
+    "server_flags": [
+      "--max-num-seqs=2",
+      "--max-num-batched-tokens=4",
+      "--max-model-len=16",
+      "--enable-chunked-prefill"
+    ]
+  },
+  "scheduler": {
+    "policy": "vllm_v1",
+    "max_num_seqs": 2,
+    "max_num_batched_tokens": 4,
+    "max_model_len": 16,
+    "prefill": {
+      "mode": "chunked",
+      "max_chunk_tokens": 2
+    }
+  },
+  "timing": {
+    "grid": {
+      "decode_reqs": [0, 1, 2],
+      "sum_decode_ctx_tokens": [0, 2, 4],
+      "prefill_tokens_in_step": [0, 2, 4],
+      "step_duration_us": [
+        50000, 150000, 250000,
+        60000, 160000, 260000,
+        70000, 170000, 270000,
+        75000, 175000, 275000,
+        85000, 185000, 285000,
+        95000, 195000, 295000,
+        100000, 200000, 300000,
+        110000, 210000, 310000,
+        120000, 220000, 320000
+      ]
+    },
+    "fallback": {
+      "t0_us": 10000.0,
+      "prefill_token_us": 10000.0,
+      "decode_request_us": 5000.0,
+      "decode_context_token_us": 1000.0
+    }
+  }
+}
