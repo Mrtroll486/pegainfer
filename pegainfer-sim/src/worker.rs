@@ -226,32 +226,42 @@ where
         &self.scheduler
     }
 
+    pub(crate) fn preflight(
+        &self,
+        prompt_tokens: u32,
+        output_tokens: u64,
+    ) -> Option<RequestRejection> {
+        let total_tokens = u64::from(prompt_tokens).saturating_add(output_tokens);
+        if total_tokens > u64::from(self.scheduler.max_model_len) {
+            return Some(RequestRejection::ModelLengthExceeded {
+                total_tokens,
+                max_model_len: self.scheduler.max_model_len,
+            });
+        }
+        if output_tokens > 0
+            && self.scheduler.prefill == PrefillPolicy::Whole
+            && prompt_tokens > self.scheduler.max_num_batched_tokens
+        {
+            return Some(RequestRejection::WholePrefillExceedsStepBudget {
+                prompt_tokens,
+                max_num_batched_tokens: self.scheduler.max_num_batched_tokens,
+            });
+        }
+        None
+    }
+
     pub fn submit(&mut self, request: WorkerRequest<I>) -> Result<SubmissionResult> {
         ensure!(
             self.request(request.id).is_none(),
             "worker request id is already active"
         );
-        let total_tokens = u64::from(request.prompt_tokens) + u64::from(request.output_tokens);
-        if total_tokens > u64::from(self.scheduler.max_model_len) {
-            return Ok(SubmissionResult::Rejected(
-                RequestRejection::ModelLengthExceeded {
-                    total_tokens,
-                    max_model_len: self.scheduler.max_model_len,
-                },
-            ));
+        if let Some(rejection) =
+            self.preflight(request.prompt_tokens, u64::from(request.output_tokens))
+        {
+            return Ok(SubmissionResult::Rejected(rejection));
         }
         if request.output_tokens == 0 {
             return Ok(SubmissionResult::Finished);
-        }
-        if self.scheduler.prefill == PrefillPolicy::Whole
-            && request.prompt_tokens > self.scheduler.max_num_batched_tokens
-        {
-            return Ok(SubmissionResult::Rejected(
-                RequestRejection::WholePrefillExceedsStepBudget {
-                    prompt_tokens: request.prompt_tokens,
-                    max_num_batched_tokens: self.scheduler.max_num_batched_tokens,
-                },
-            ));
         }
         self.waiting.push_back(RequestState::new(request));
         Ok(SubmissionResult::Queued)

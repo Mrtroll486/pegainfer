@@ -115,6 +115,13 @@ impl SimulatedEngineConfig {
         self
     }
 
+    /// Set the token id used for empty prompts in either scheduler mode.
+    #[must_use]
+    pub fn with_fallback_token_id(mut self, fallback_token_id: u32) -> Self {
+        self.fallback_token_id = fallback_token_id;
+        self
+    }
+
     /// Use a validated engine profile for online step timing and scheduling.
     /// CLI loading belongs to the following commit; this entry point keeps
     /// the profiled path injectable for the scheduler and focused tests.
@@ -131,11 +138,11 @@ impl SimulatedEngineConfig {
         Ok(self)
     }
 
-    fn ttft(&self, prompt_tokens: usize) -> Duration {
+    fn ttft(&self, prompt_tokens: usize) -> Result<Duration> {
         duration_from_ms(self.base_ttft_ms + prompt_tokens as f64 / self.prefill_tokens_per_ms)
     }
 
-    fn tpot(&self) -> Duration {
+    fn tpot(&self) -> Result<Duration> {
         duration_from_ms(self.tpot_ms)
     }
 }
@@ -306,6 +313,13 @@ impl ProfiledRuntime {
             }
             let prompt_tokens = u32::try_from(request.prompt_tokens.len())
                 .context("profiled request prompt length exceeds u32")?;
+            let output_token_count = planned_completion_len(config, request.max_tokens);
+            let output_token_count_u64 = u64::try_from(output_token_count)
+                .context("profiled output length overflows u64")?;
+            if let Some(rejection) = self.worker.preflight(prompt_tokens, output_token_count_u64) {
+                ledger.reject(id, reject_reason(rejection, &request));
+                continue;
+            }
             let (mut completion_tokens, finish_reason) =
                 planned_completion(config, &request.prompt_tokens, request.max_tokens);
             completion_tokens.reverse();
@@ -483,16 +497,11 @@ fn reject_reason(rejection: RequestRejection, request: &Request) -> RejectReason
             max_tokens: request.max_tokens,
             limit: max_model_len as usize,
         },
-        // The frontend contract has no generic step-budget refusal yet. The
-        // context-length variant still gives the caller a typed rejection and
-        // a non-retryable admission result; CLI/profile validation will keep
-        // this case out of normal target profiles.
         RequestRejection::WholePrefillExceedsStepBudget {
             prompt_tokens,
             max_num_batched_tokens,
-        } => RejectReason::ContextLength {
+        } => RejectReason::PrefillStepBudget {
             prompt_tokens: prompt_tokens as usize,
-            max_tokens: request.max_tokens,
             limit: max_num_batched_tokens as usize,
         },
     }
@@ -545,8 +554,7 @@ impl Scheduler for SimScheduler {
             self.profiled = Some(profiled);
             return result;
         }
-        self.step_legacy(ledger);
-        Ok(())
+        self.step_legacy(ledger)
     }
 
     fn metrics(&self) -> SchedulerMetrics {
@@ -563,7 +571,7 @@ impl Scheduler for SimScheduler {
 }
 
 impl SimScheduler {
-    fn step_legacy(&mut self, ledger: &mut RequestLedger) {
+    fn step_legacy(&mut self, ledger: &mut RequestLedger) -> Result<()> {
         for QueuedRequest { id, request } in self.queued.drain(..) {
             if ledger.is_aborted(id) {
                 ledger.retire(id);
@@ -589,7 +597,7 @@ impl SimScheduler {
             self.running.push(RunningRequest {
                 id,
                 pending,
-                next_token_at: Instant::now() + self.config.ttft(prompt_len),
+                next_token_at: Instant::now() + self.config.ttft(prompt_len)?,
                 finish_reason,
                 logprobs: request.logprobs,
             });
@@ -628,12 +636,13 @@ impl SimScheduler {
             if running.pending.is_empty() {
                 ledger.finish(running.id, running.finish_reason);
             } else {
-                running.next_token_at = Instant::now() + self.config.tpot();
+                running.next_token_at = Instant::now() + self.config.tpot()?;
                 still_running.push(running);
             }
         }
         self.running = still_running;
         self.park_if_waiting();
+        Ok(())
     }
 }
 
@@ -666,6 +675,14 @@ fn planned_completion(
     (pending, finish_reason)
 }
 
+fn planned_completion_len(config: &SimulatedEngineConfig, max_tokens: usize) -> usize {
+    if config.scripted_completion.is_empty() {
+        max_tokens
+    } else {
+        max_tokens.min(config.scripted_completion.len())
+    }
+}
+
 fn fake_token_id(prompt_tokens: &[u32], index: usize, fallback_token_id: u32) -> u32 {
     if prompt_tokens.is_empty() {
         return fallback_token_id;
@@ -673,8 +690,13 @@ fn fake_token_id(prompt_tokens: &[u32], index: usize, fallback_token_id: u32) ->
     prompt_tokens[index % prompt_tokens.len()]
 }
 
-fn duration_from_ms(ms: f64) -> Duration {
-    Duration::from_secs_f64(ms / 1000.0)
+fn duration_from_ms(ms: f64) -> Result<Duration> {
+    ensure!(
+        ms.is_finite() && ms >= 0.0,
+        "timing value must be finite and non-negative"
+    );
+    Duration::try_from_secs_f64(ms / 1000.0)
+        .context("timing value is not representable as a Duration")
 }
 
 fn duration_from_us(microseconds: u64) -> Duration {

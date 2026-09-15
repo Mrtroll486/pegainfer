@@ -115,8 +115,9 @@ fn build_runtime(args: &Args) -> Result<RuntimeConfig> {
         } else {
             OutOfDomainPolicy::WarnAndFallback
         };
-        let engine =
-            SimulatedEngineConfig::default().with_engine_profile(profile.clone(), out_of_domain)?;
+        let engine = SimulatedEngineConfig::default()
+            .with_fallback_token_id(args.fallback_token_id)
+            .with_engine_profile(profile.clone(), out_of_domain)?;
         let model_path = args.model_path.clone().unwrap_or_else(|| {
             args.model_id
                 .as_deref()
