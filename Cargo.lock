@@ -3928,6 +3928,7 @@ dependencies = [
  "anyhow",
  "clap",
  "log",
+ "logforth",
  "pegainfer-frontend",
  "reqwest 0.12.28",
  "serde",

@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Once;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -6,16 +7,8 @@ use anyhow::bail;
 use anyhow::ensure;
 use clap::Parser;
 use pegainfer_sim::SimulatedEngineConfig;
-use pegainfer_sim::profile::ENGINE_PROFILE_SCHEMA_VERSION;
 use pegainfer_sim::profile::EngineProfile;
 use pegainfer_sim::profile::OutOfDomainPolicy;
-use pegainfer_sim::profile::ParametricFallback;
-use pegainfer_sim::profile::PrefillPolicy;
-use pegainfer_sim::profile::ProfileProvenance;
-use pegainfer_sim::profile::SchedulerPolicy;
-use pegainfer_sim::profile::SchedulerProfile;
-use pegainfer_sim::profile::StepTimingProfile;
-use pegainfer_sim::profile::TimingGrid;
 use pegainfer_sim::start_engine;
 
 const DEFAULT_MODEL_ID: &str = "Qwen/Qwen3-0.6B";
@@ -24,7 +17,8 @@ const DEFAULT_BASE_TTFT_MS: f64 = 5.0;
 const DEFAULT_PREFILL_TOKENS_PER_MS: f64 = 100.0;
 const DEFAULT_TPOT_MS: f64 = 12.0;
 const DEFAULT_FALLBACK_TOKEN_ID: u32 = 0;
-const LEGACY_MAX_NUM_SEQS: u32 = 1024;
+
+static LOGGING_INIT: Once = Once::new();
 
 #[derive(Parser, Debug)]
 #[command(
@@ -82,8 +76,8 @@ struct RuntimeConfig {
     model_path: PathBuf,
     served_model_name: Vec<String>,
     max_model_len: u32,
-    profile: EngineProfile,
-    out_of_domain: OutOfDomainPolicy,
+    profile: Option<EngineProfile>,
+    out_of_domain: Option<OutOfDomainPolicy>,
 }
 
 fn build_runtime(args: &Args) -> Result<RuntimeConfig> {
@@ -128,8 +122,8 @@ fn build_runtime(args: &Args) -> Result<RuntimeConfig> {
             model_path,
             served_model_name: vec![model_id],
             max_model_len: profile.scheduler.max_model_len,
-            profile,
-            out_of_domain,
+            profile: Some(profile),
+            out_of_domain: Some(out_of_domain),
         });
     }
 
@@ -151,6 +145,7 @@ fn build_runtime(args: &Args) -> Result<RuntimeConfig> {
         .clone()
         .unwrap_or_else(|| PathBuf::from(&model_id));
     let max_model_len = args.max_model_len.unwrap_or(DEFAULT_MAX_MODEL_LEN);
+    ensure!(max_model_len > 0, "max_model_len must be positive");
     let base_ttft_ms = args.base_ttft_ms.unwrap_or(DEFAULT_BASE_TTFT_MS);
     let prefill_tokens_per_ms = args
         .prefill_tokens_per_ms
@@ -162,15 +157,6 @@ fn build_runtime(args: &Args) -> Result<RuntimeConfig> {
         tpot_ms,
         args.fallback_token_id,
     )?;
-    let profile = legacy_profile(
-        &model_id,
-        max_model_len,
-        base_ttft_ms,
-        prefill_tokens_per_ms,
-        tpot_ms,
-    )?;
-    let out_of_domain = OutOfDomainPolicy::WarnAndFallback;
-    let engine = engine.with_engine_profile(profile.clone(), out_of_domain)?;
     Ok(RuntimeConfig {
         engine,
         model_path,
@@ -180,8 +166,8 @@ fn build_runtime(args: &Args) -> Result<RuntimeConfig> {
             Vec::new()
         },
         max_model_len,
-        profile,
-        out_of_domain,
+        profile: None,
+        out_of_domain: None,
     })
 }
 
@@ -200,137 +186,46 @@ fn ensure_legacy_timing_flags_are_absent(args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn legacy_profile(
-    model_id: &str,
-    max_model_len: u32,
-    base_ttft_ms: f64,
-    prefill_tokens_per_ms: f64,
-    tpot_ms: f64,
-) -> Result<EngineProfile> {
-    ensure!(max_model_len > 0, "max_model_len must be positive");
-    let max_num_seqs = LEGACY_MAX_NUM_SEQS;
-    let max_num_batched_tokens = max_num_seqs.max(max_model_len);
-    let max_context = u64::from(max_num_seqs)
-        .checked_mul(u64::from(max_model_len))
-        .context("legacy profile context domain overflow")?;
-    let base_us = milliseconds_to_micros(base_ttft_ms)?;
-    let prefill_token_us = 1_000.0 / prefill_tokens_per_ms;
-    let decode_request_us = milliseconds_to_micros(tpot_ms)? as f64;
-    let decode_reqs = vec![0, 1, max_num_seqs];
-    let sum_decode_ctx_tokens = vec![0, 1, max_context];
-    let prefill_tokens_in_step = vec![0, 1, max_num_batched_tokens];
-    let mut step_duration_us = Vec::with_capacity(
-        decode_reqs.len() * sum_decode_ctx_tokens.len() * prefill_tokens_in_step.len(),
-    );
-    for &decode in &decode_reqs {
-        for &context in &sum_decode_ctx_tokens {
-            for &prefill in &prefill_tokens_in_step {
-                step_duration_us.push(legacy_step_duration_us(
-                    base_us,
-                    prefill_token_us,
-                    decode_request_us,
-                    decode,
-                    context,
-                    prefill,
-                )?);
-            }
-        }
-    }
-    Ok(EngineProfile {
-        schema_version: ENGINE_PROFILE_SCHEMA_VERSION,
-        profile_id: "legacy-cli".to_string(),
-        provenance: ProfileProvenance {
-            target_engine: "pegainfer-sim".to_string(),
-            engine_version: env!("CARGO_PKG_VERSION").to_string(),
-            model_id: model_id.to_string(),
-            model_revision: "legacy-cli".to_string(),
-            model_config_sha256: "00".repeat(32),
-            gpu: "cpu".to_string(),
-            server_flags: vec!["legacy-timing-options".to_string()],
-        },
-        scheduler: SchedulerProfile {
-            policy: SchedulerPolicy::VllmV1,
-            max_num_seqs,
-            max_num_batched_tokens,
-            max_model_len,
-            prefill: PrefillPolicy::Chunked {
-                max_chunk_tokens: max_num_batched_tokens,
-            },
-        },
-        timing: StepTimingProfile {
-            grid: TimingGrid {
-                decode_reqs,
-                sum_decode_ctx_tokens,
-                prefill_tokens_in_step,
-                step_duration_us,
-            },
-            fallback: ParametricFallback {
-                t0_us: base_us as f64,
-                prefill_token_us,
-                decode_request_us,
-                decode_context_token_us: 0.0,
-            },
-        },
-    })
-}
-
-fn legacy_step_duration_us(
-    base_us: u64,
-    prefill_token_us: f64,
-    decode_request_us: f64,
-    decode_reqs: u32,
-    sum_decode_ctx_tokens: u64,
-    prefill_tokens: u32,
-) -> Result<u64> {
-    let mut duration_us = if decode_reqs > 0 && prefill_tokens == 0 && sum_decode_ctx_tokens == 0 {
-        base_us as f64
-    } else {
-        decode_request_us * f64::from(decode_reqs)
-    };
-    if prefill_tokens > 0 {
-        duration_us += base_us as f64 + prefill_token_us * f64::from(prefill_tokens);
-    }
-    ensure!(
-        duration_us.is_finite() && duration_us >= 0.0 && duration_us < u64::MAX as f64,
-        "legacy profile timing overflow"
-    );
-    Ok(duration_us.round() as u64)
-}
-
-fn milliseconds_to_micros(milliseconds: f64) -> Result<u64> {
-    ensure!(
-        milliseconds.is_finite() && milliseconds >= 0.0,
-        "timing values must be finite and non-negative"
-    );
-    let micros = milliseconds * 1_000.0;
-    ensure!(
-        micros < u64::MAX as f64,
-        "timing value is too large to represent in microseconds"
-    );
-    Ok(micros.round() as u64)
-}
-
 fn report_profile(runtime: &RuntimeConfig) {
-    let scheduler = &runtime.profile.scheduler;
+    let Some(profile) = &runtime.profile else {
+        eprintln!("active engine profile: legacy fixed TTFT/TPOT scheduler");
+        return;
+    };
+    let scheduler = &profile.scheduler;
     eprintln!(
         "active engine profile: id={} target={} version={} model={} revision={} gpu={} scheduler={:?} max_num_seqs={} max_num_batched_tokens={} max_model_len={} timing_domain={:?} out_of_domain={:?}",
-        runtime.profile.profile_id,
-        runtime.profile.provenance.target_engine,
-        runtime.profile.provenance.engine_version,
-        runtime.profile.provenance.model_id,
-        runtime.profile.provenance.model_revision,
-        runtime.profile.provenance.gpu,
+        profile.profile_id,
+        profile.provenance.target_engine,
+        profile.provenance.engine_version,
+        profile.provenance.model_id,
+        profile.provenance.model_revision,
+        profile.provenance.gpu,
         scheduler.policy,
         scheduler.max_num_seqs,
         scheduler.max_num_batched_tokens,
         scheduler.max_model_len,
-        runtime.profile.timing.grid.domain(),
+        profile.timing.grid.domain(),
         runtime.out_of_domain,
     );
 }
 
+fn init_logging() {
+    LOGGING_INIT.call_once(|| {
+        let filter_spec = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+        let filter = logforth::filter::env_filter::EnvFilterBuilder::from_spec(filter_spec).build();
+        logforth::starter_log::builder()
+            .dispatch(|dispatch| {
+                dispatch
+                    .filter(filter)
+                    .append(logforth::append::Stderr::default())
+            })
+            .apply();
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_logging();
     let args = Args::parse();
     let runtime = build_runtime(&args)?;
     report_profile(&runtime);
@@ -345,4 +240,39 @@ async fn main() -> Result<()> {
         pegainfer_frontend::vllm::shutdown_token_from_ctrl_c(),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn legacy_args() -> Args {
+        Args {
+            model_id: Some("test-model".to_string()),
+            model_path: None,
+            port: 8000,
+            max_model_len: None,
+            base_ttft_ms: None,
+            prefill_tokens_per_ms: None,
+            tpot_ms: None,
+            fallback_token_id: DEFAULT_FALLBACK_TOKEN_ID,
+            profile: None,
+            strict: false,
+        }
+    }
+
+    #[test]
+    fn legacy_cli_keeps_fixed_timing_scheduler() {
+        let runtime = build_runtime(&legacy_args()).expect("legacy runtime should build");
+
+        assert!(runtime.profile.is_none());
+        assert!(runtime.out_of_domain.is_none());
+    }
+
+    #[test]
+    fn sim_logger_accepts_warn_records() {
+        init_logging();
+
+        assert!(log::log_enabled!(target: "pegainfer_sim::profile", log::Level::Warn));
+    }
 }

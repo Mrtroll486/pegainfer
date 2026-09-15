@@ -26,10 +26,11 @@ cannot be combined with an explicit profile.
 
 Timing: with a profile, `SimScheduler::step` prices one worker step from its
 decode/prefill shape and commits progress only after that step duration. Without
-an explicit profile, the CLI converts the legacy flags into a `legacy-cli`
-degenerate profile, preserving `base_ttft_ms + prompt_len /
-prefill_tokens_per_ms` for prefill and fixed `tpot_ms` for subsequent decode.
-The Rust API still keeps its legacy path when callers do not attach a profile.
+an explicit profile, the CLI keeps the legacy per-request scheduler, preserving
+`base_ttft_ms + prompt_len / prefill_tokens_per_ms` for prefill and fixed
+`tpot_ms` for subsequent decode independently of batch width. The Rust API has
+the same legacy behavior when callers do not attach a profile. The standalone
+CLI initializes stderr logging so out-of-domain profile fallbacks remain visible.
 
 Output token ids cycle through the prompt tokens, or replay a scripted sequence (tool-call tests). Empty prompts use the fallback id.
 
