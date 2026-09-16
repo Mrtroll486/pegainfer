@@ -669,6 +669,28 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_after_nonterminal_step_completion_removes_running_request() {
+        let mut worker = WorkerState::new(scheduler(1, 4, 16, PrefillPolicy::Whole)).unwrap();
+        worker.submit(request(1, 0, 3)).unwrap();
+
+        let step_id = worker.plan_step().unwrap().unwrap().id();
+        let outcome = worker.complete_step(step_id).unwrap();
+        assert_eq!(
+            outcome.generated,
+            [GeneratedToken {
+                request_id: 1,
+                token_index: 1
+            }]
+        );
+        assert!(outcome.finished.is_empty());
+        assert!(worker.request(1).is_some());
+
+        assert_eq!(worker.cancel(1), CancelResult::Cancelled);
+        assert!(worker.request(1).is_none());
+        assert!(worker.plan_step().unwrap().is_none());
+    }
+
+    #[test]
     fn generated_plans_never_exceed_sequence_or_token_capacity() {
         for max_num_seqs in 1..=4 {
             for max_num_batched_tokens in max_num_seqs..=6 {

@@ -402,6 +402,7 @@ impl ProfiledRuntime {
                 cancelled.push(request_id);
             }
         }
+        self.cancel_worker_requests(&cancelled)?;
         for &request_id in &cancelled {
             if ledger.is_active(request_id) {
                 ledger.retire(request_id);
@@ -464,6 +465,22 @@ impl ProfiledRuntime {
         if let (Some(counters), Some((k, accepted))) = (spec_decode.as_mut(), config.spec_decode) {
             for _ in 0..decode_reqs {
                 counters.observe_draft(k, accepted);
+            }
+        }
+        Ok(())
+    }
+
+    fn cancel_worker_requests(&mut self, request_ids: &[RequestId]) -> Result<()> {
+        for &request_id in request_ids {
+            match self.worker.cancel(request_id) {
+                // `Cancelled` is the late-abort case: complete_step has
+                // already cleared the worker's in-flight plan, so the request
+                // must be removed from running here before its ledger account
+                // and metadata are retired below.
+                CancelResult::Cancelled | CancelResult::NotFound => {}
+                CancelResult::Deferred | CancelResult::AlreadyRequested => {
+                    bail!("profiled request {request_id} remained in flight during cancellation")
+                }
             }
         }
         Ok(())
@@ -848,6 +865,48 @@ mod tests {
                 completion_tokens: 3,
             }
         ));
+    }
+
+    #[test]
+    fn late_abort_cleanup_removes_nonterminal_worker_request() {
+        let profile = zero_cost_profile();
+        let mut runtime = ProfiledRuntime::new(&ProfileConfig {
+            profile,
+            out_of_domain: OutOfDomainPolicy::Strict,
+        });
+        let request_id = RequestId::new(7);
+        let survivor_id = RequestId::new(8);
+        runtime
+            .worker
+            .submit(WorkerRequest {
+                id: request_id,
+                prompt_tokens: 0,
+                output_tokens: 2,
+            })
+            .unwrap();
+        runtime
+            .worker
+            .submit(WorkerRequest {
+                id: survivor_id,
+                prompt_tokens: 0,
+                output_tokens: 2,
+            })
+            .unwrap();
+
+        let step_id = runtime.worker.plan_step().unwrap().unwrap().id();
+        let outcome = runtime.worker.complete_step(step_id).unwrap();
+        assert_eq!(outcome.generated.len(), 2);
+        assert!(outcome.finished.is_empty());
+        assert!(runtime.worker.request(request_id).is_some());
+        assert!(runtime.worker.request(survivor_id).is_some());
+
+        runtime.cancel_worker_requests(&[request_id]).unwrap();
+        assert!(runtime.worker.request(request_id).is_none());
+
+        let survivor_step_id = runtime.worker.plan_step().unwrap().unwrap().id();
+        let survivor_outcome = runtime.worker.complete_step(survivor_step_id).unwrap();
+        assert_eq!(survivor_outcome.finished, [survivor_id]);
+        assert!(runtime.worker.request(survivor_id).is_none());
     }
 
     #[test]
