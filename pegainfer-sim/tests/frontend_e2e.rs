@@ -10,7 +10,6 @@ use anyhow::bail;
 use pegainfer_sim::SimulatedEngineConfig;
 use pegainfer_sim::profile::EngineProfile;
 use pegainfer_sim::profile::LoadedEngineProfile;
-use pegainfer_sim::profile::OutOfDomainPolicy;
 use pegainfer_sim::profile::StepShape;
 use pegainfer_sim::start_engine;
 use pegainfer_sim::start_engine_with_partitions;
@@ -258,7 +257,7 @@ fn replay_profiled_worker(profile: &LoadedEngineProfile) -> Result<Vec<PlanTrace
             .context("worker with active requests produced no step")?;
         let step_id = plan.id();
         let shape = plan.shape();
-        let estimate = profile.estimate_step(shape, OutOfDomainPolicy::Strict)?;
+        let estimate = profile.estimate_step(shape)?;
         assert!(matches!(
             estimate.source,
             pegainfer_sim::profile::StepTimingSource::GridInterpolation
@@ -372,21 +371,18 @@ fn zero_cost_profile_fixture_is_valid() -> Result<()> {
     let (_fixture_dir, profile) = profile_fixture("online-zero-cost.json")?;
     assert!(
         profile
-            .timing
+            .predictor
             .grid
             .step_duration_us
             .iter()
             .all(|duration| *duration == 0),
         "zero-cost fixture must not add synthetic engine delay"
     );
-    let estimate = profile.estimate_step(
-        StepShape {
-            decode_reqs: 1,
-            sum_decode_ctx_tokens: 2,
-            prefill_tokens_in_step: 0,
-        },
-        OutOfDomainPolicy::Strict,
-    )?;
+    let estimate = profile.estimate_step(StepShape {
+        decode_reqs: 1,
+        sum_decode_ctx_tokens: 2,
+        prefill_tokens_in_step: 0,
+    })?;
     assert_eq!(estimate.duration_us, 0);
 
     Ok(())
@@ -395,8 +391,7 @@ fn zero_cost_profile_fixture_is_valid() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn profiled_online_worker_serves_multi_request_workload() -> Result<()> {
     let (_fixture_dir, profile) = profile_fixture("online-step-gate.json")?;
-    let config =
-        SimulatedEngineConfig::default().with_engine_profile(profile, OutOfDomainPolicy::Strict)?;
+    let config = SimulatedEngineConfig::default().with_engine_profile(profile)?;
     let server = SimServer::spawn_with_config(
         model_dir_with_minimal_metadata()?,
         1,
@@ -485,8 +480,7 @@ async fn profiled_online_worker_serves_multi_request_workload() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zero_cost_profile_measures_frontend_baseline() -> Result<()> {
     let (_fixture_dir, profile) = profile_fixture("online-zero-cost.json")?;
-    let config =
-        SimulatedEngineConfig::default().with_engine_profile(profile, OutOfDomainPolicy::Strict)?;
+    let config = SimulatedEngineConfig::default().with_engine_profile(profile)?;
     let server = SimServer::spawn_with_config(
         model_dir_with_minimal_metadata()?,
         1,

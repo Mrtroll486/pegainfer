@@ -25,7 +25,6 @@ pub mod worker;
 
 use profile::EngineProfile;
 use profile::LoadedEngineProfile;
-use profile::OutOfDomainPolicy;
 use worker::CancelResult;
 use worker::GeneratedToken;
 use worker::RequestRejection;
@@ -59,7 +58,6 @@ pub struct SimulatedEngineConfig {
 #[derive(Clone, Debug)]
 struct ProfileConfig {
     profile: LoadedEngineProfile,
-    out_of_domain: OutOfDomainPolicy,
 }
 
 impl SimulatedEngineConfig {
@@ -126,16 +124,9 @@ impl SimulatedEngineConfig {
 
     /// Use a profile bundle whose calibration manifest has already been
     /// validated for online step timing and scheduling.
-    pub fn with_engine_profile(
-        mut self,
-        profile: LoadedEngineProfile,
-        out_of_domain: OutOfDomainPolicy,
-    ) -> Result<Self> {
+    pub fn with_engine_profile(mut self, profile: LoadedEngineProfile) -> Result<Self> {
         profile.validate()?;
-        self.profile = Some(ProfileConfig {
-            profile,
-            out_of_domain,
-        });
+        self.profile = Some(ProfileConfig { profile });
         Ok(self)
     }
 
@@ -209,7 +200,6 @@ struct RunningRequest {
 
 struct ProfiledRuntime {
     profile: EngineProfile,
-    out_of_domain: OutOfDomainPolicy,
     worker: WorkerState<RequestId>,
     requests: HashMap<RequestId, ProfiledRequest>,
     in_flight: Option<ProfiledInFlight>,
@@ -235,7 +225,6 @@ impl ProfiledRuntime {
             .expect("profile was validated before scheduler construction");
         Self {
             profile: config.profile.profile.clone(),
-            out_of_domain: config.out_of_domain,
             worker,
             requests: HashMap::new(),
             in_flight: None,
@@ -269,7 +258,7 @@ impl ProfiledRuntime {
         };
         let step_id = plan.id();
         let shape = plan.shape();
-        let estimate = self.profile.estimate_step(shape, self.out_of_domain)?;
+        let estimate = self.profile.estimate_step(shape)?;
         for &request_id in plan.admitted() {
             let request = self
                 .requests
@@ -718,11 +707,11 @@ mod tests {
     use crate::profile::CalibrationManifest;
     use crate::profile::CalibrationReference;
     use crate::profile::ENGINE_PROFILE_SCHEMA_VERSION;
-    use crate::profile::ParametricFallback;
+    use crate::profile::PredictorCoverage;
+    use crate::profile::PredictorProfile;
     use crate::profile::PrefillPolicy;
     use crate::profile::SchedulerPolicy;
     use crate::profile::SchedulerProfile;
-    use crate::profile::StepTimingProfile;
     use crate::profile::TimingGrid;
 
     fn request(prompt_tokens: Vec<u32>, max_tokens: usize, logprobs: usize) -> Request {
@@ -784,18 +773,17 @@ mod tests {
                     max_model_len: 32,
                     prefill: PrefillPolicy::Whole,
                 },
-                timing: StepTimingProfile {
+                predictor: PredictorProfile {
+                    coverage: PredictorCoverage {
+                        decode_reqs: [0, 2],
+                        sum_decode_ctx_tokens: [0, 8],
+                        prefill_tokens_in_step: [0, 4],
+                    },
                     grid: TimingGrid {
                         decode_reqs: vec![0, 2],
                         sum_decode_ctx_tokens: vec![0, 8],
                         prefill_tokens_in_step: vec![0, 4],
                         step_duration_us: vec![0; 8],
-                    },
-                    fallback: ParametricFallback {
-                        t0_us: 0.0,
-                        prefill_token_us: 0.0,
-                        decode_request_us: 0.0,
-                        decode_context_token_us: 0.0,
                     },
                 },
             },
@@ -860,7 +848,7 @@ mod tests {
     #[test]
     fn profiled_scheduler_replays_scripted_completion() {
         let config = SimulatedEngineConfig::default()
-            .with_engine_profile(zero_cost_profile(), OutOfDomainPolicy::Strict)
+            .with_engine_profile(zero_cost_profile())
             .unwrap()
             .with_scripted_completion(vec![11, 22, 33]);
         let (tokens, prompt_tokens, terminal) =
@@ -880,10 +868,7 @@ mod tests {
     #[test]
     fn late_abort_cleanup_removes_nonterminal_worker_request() {
         let profile = zero_cost_profile();
-        let mut runtime = ProfiledRuntime::new(&ProfileConfig {
-            profile,
-            out_of_domain: OutOfDomainPolicy::Strict,
-        });
+        let mut runtime = ProfiledRuntime::new(&ProfileConfig { profile });
         let request_id = RequestId::new(7);
         let survivor_id = RequestId::new(8);
         runtime

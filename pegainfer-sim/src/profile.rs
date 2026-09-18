@@ -22,16 +22,19 @@ pub struct EngineProfile {
     pub schema_version: u32,
     pub calibration: CalibrationReference,
     pub scheduler: SchedulerProfile,
-    pub timing: StepTimingProfile,
+    pub predictor: PredictorProfile,
 }
 
 impl EngineProfile {
     pub fn from_json_slice(bytes: &[u8]) -> Result<Self> {
         let value: serde_json::Value =
             serde_json::from_slice(bytes).context("failed to parse engine profile JSON")?;
-        if value.get("profile_id").is_some() || value.get("provenance").is_some() {
+        if value.get("profile_id").is_some()
+            || value.get("provenance").is_some()
+            || value.get("timing").is_some()
+        {
             bail!(
-                "legacy engine profile fields 'profile_id'/'provenance' are unsupported; migrate to schema_version {ENGINE_PROFILE_SCHEMA_VERSION} with a calibration manifest reference"
+                "legacy engine profile fields 'profile_id'/'provenance'/'timing' are unsupported; migrate to schema_version {ENGINE_PROFILE_SCHEMA_VERSION} with a calibration manifest reference and explicit predictor coverage"
             );
         }
         let profile: Self =
@@ -92,38 +95,26 @@ impl EngineProfile {
         );
         self.calibration.validate()?;
         self.scheduler.validate()?;
-        self.timing.validate(&self.scheduler)
+        self.predictor.validate(&self.scheduler)
     }
 
-    pub fn estimate_step(
-        &self,
-        shape: StepShape,
-        out_of_domain: OutOfDomainPolicy,
-    ) -> Result<StepTimingEstimate> {
+    pub fn estimate_step(&self, shape: StepShape) -> Result<StepTimingEstimate> {
         self.scheduler.validate_shape(shape)?;
-        if let Some(duration_us) = self.timing.grid.interpolate(shape)? {
-            return Ok(StepTimingEstimate {
-                duration_us,
-                source: StepTimingSource::GridInterpolation,
-            });
-        }
-
-        let domain = self.timing.grid.domain();
-        if out_of_domain == OutOfDomainPolicy::Strict {
-            bail!(
-                "calibration manifest '{}' (sha256 {}) does not cover step shape {shape:?}; supported grid domain: {domain:?}",
-                self.calibration.manifest,
-                self.calibration.sha256,
-            );
-        }
-        log::warn!(
-            "calibration manifest '{}' (sha256 {}) does not cover step shape {shape:?}; using parametric fallback outside grid domain {domain:?}",
+        let domain = self.predictor.coverage.domain();
+        ensure!(
+            self.predictor.coverage.contains(shape),
+            "calibration manifest '{}' (sha256 {}) does not cover step shape {shape:?}; supported predictor coverage: {domain:?}",
             self.calibration.manifest,
             self.calibration.sha256,
         );
+        let duration_us = self
+            .predictor
+            .grid
+            .interpolate(shape)?
+            .context("predictor coverage contains a shape with no grid duration")?;
         Ok(StepTimingEstimate {
-            duration_us: self.timing.fallback.evaluate(shape)?,
-            source: StepTimingSource::ParametricFallback,
+            duration_us,
+            source: StepTimingSource::GridInterpolation,
         })
     }
 }
@@ -315,15 +306,80 @@ pub struct StepShape {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct StepTimingProfile {
+pub struct PredictorProfile {
+    pub coverage: PredictorCoverage,
     pub grid: TimingGrid,
-    pub fallback: ParametricFallback,
 }
 
-impl StepTimingProfile {
+impl PredictorProfile {
     fn validate(&self, scheduler: &SchedulerProfile) -> Result<()> {
         self.grid.validate(scheduler)?;
-        self.fallback.validate()
+        self.coverage.validate(scheduler, &self.grid)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PredictorCoverage {
+    pub decode_reqs: [u32; 2],
+    pub sum_decode_ctx_tokens: [u64; 2],
+    pub prefill_tokens_in_step: [u32; 2],
+}
+
+impl PredictorCoverage {
+    fn validate(&self, scheduler: &SchedulerProfile, grid: &TimingGrid) -> Result<()> {
+        validate_range("predictor.coverage.decode_reqs", self.decode_reqs)?;
+        validate_range(
+            "predictor.coverage.sum_decode_ctx_tokens",
+            self.sum_decode_ctx_tokens,
+        )?;
+        validate_range(
+            "predictor.coverage.prefill_tokens_in_step",
+            self.prefill_tokens_in_step,
+        )?;
+        ensure!(
+            self.decode_reqs[1] <= scheduler.max_num_seqs,
+            "predictor.coverage.decode_reqs exceed scheduler.max_num_seqs"
+        );
+        ensure!(
+            self.prefill_tokens_in_step[1] <= scheduler.max_num_batched_tokens,
+            "predictor.coverage.prefill_tokens_in_step exceed scheduler.max_num_batched_tokens"
+        );
+        let max_context = u64::from(scheduler.max_num_seqs)
+            .checked_mul(u64::from(scheduler.max_model_len))
+            .context("scheduler context domain overflow")?;
+        ensure!(
+            self.sum_decode_ctx_tokens[1] <= max_context,
+            "predictor.coverage.sum_decode_ctx_tokens exceed the scheduler context domain"
+        );
+        let grid_domain = grid
+            .domain()
+            .context("timing grid must contain all predictor coverage axes")?;
+        ensure!(
+            self.domain() == grid_domain,
+            "predictor coverage must match the timing grid domain"
+        );
+        Ok(())
+    }
+
+    fn contains(&self, shape: StepShape) -> bool {
+        self.decode_reqs[0] <= shape.decode_reqs
+            && shape.decode_reqs <= self.decode_reqs[1]
+            && self.sum_decode_ctx_tokens[0] <= shape.sum_decode_ctx_tokens
+            && shape.sum_decode_ctx_tokens <= self.sum_decode_ctx_tokens[1]
+            && self.prefill_tokens_in_step[0] <= shape.prefill_tokens_in_step
+            && shape.prefill_tokens_in_step <= self.prefill_tokens_in_step[1]
+    }
+
+    pub fn domain(&self) -> TimingDomain {
+        TimingDomain {
+            min_decode_reqs: self.decode_reqs[0],
+            max_decode_reqs: self.decode_reqs[1],
+            min_sum_decode_ctx_tokens: self.sum_decode_ctx_tokens[0],
+            max_sum_decode_ctx_tokens: self.sum_decode_ctx_tokens[1],
+            min_prefill_tokens_in_step: self.prefill_tokens_in_step[0],
+            max_prefill_tokens_in_step: self.prefill_tokens_in_step[1],
+        }
     }
 }
 
@@ -462,50 +518,9 @@ pub struct TimingDomain {
     pub max_prefill_tokens_in_step: u32,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ParametricFallback {
-    pub t0_us: f64,
-    pub prefill_token_us: f64,
-    pub decode_request_us: f64,
-    pub decode_context_token_us: f64,
-}
-
-impl ParametricFallback {
-    fn validate(&self) -> Result<()> {
-        validate_coefficient("timing.fallback.t0_us", self.t0_us)?;
-        validate_coefficient("timing.fallback.prefill_token_us", self.prefill_token_us)?;
-        validate_coefficient("timing.fallback.decode_request_us", self.decode_request_us)?;
-        validate_coefficient(
-            "timing.fallback.decode_context_token_us",
-            self.decode_context_token_us,
-        )
-    }
-
-    fn evaluate(&self, shape: StepShape) -> Result<u64> {
-        let duration_us = self.t0_us
-            + self.prefill_token_us * f64::from(shape.prefill_tokens_in_step)
-            + self.decode_request_us * f64::from(shape.decode_reqs)
-            + self.decode_context_token_us * shape.sum_decode_ctx_tokens as f64;
-        let rounded = duration_us.round();
-        ensure!(
-            rounded.is_finite() && rounded >= 0.0 && rounded < u64::MAX as f64,
-            "parametric timing fallback overflow for step shape {shape:?}"
-        );
-        Ok(rounded as u64)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OutOfDomainPolicy {
-    WarnAndFallback,
-    Strict,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StepTimingSource {
     GridInterpolation,
-    ParametricFallback,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -605,10 +620,15 @@ where
     Ok(())
 }
 
-fn validate_coefficient(name: &str, value: f64) -> Result<()> {
+fn validate_range<T>(name: &str, range: [T; 2]) -> Result<()>
+where
+    T: Copy + Ord + Display,
+{
     ensure!(
-        value.is_finite() && value >= 0.0,
-        "{name} must be finite and non-negative"
+        range[0] <= range[1],
+        "{name} must be ordered, found {} then {}",
+        range[0],
+        range[1]
     );
     Ok(())
 }
@@ -637,18 +657,17 @@ mod tests {
                     "max_chunk_tokens": 8
                 }
             },
-            "timing": {
+            "predictor": {
+                "coverage": {
+                    "decode_reqs": [0, 2],
+                    "sum_decode_ctx_tokens": [0, 20],
+                    "prefill_tokens_in_step": [0, 10]
+                },
                 "grid": {
                     "decode_reqs": [0, 2],
                     "sum_decode_ctx_tokens": [0, 20],
                     "prefill_tokens_in_step": [0, 10],
                     "step_duration_us": [10, 80, 70, 140, 210, 280, 270, 340]
-                },
-                "fallback": {
-                    "t0_us": 1.0,
-                    "prefill_token_us": 2.0,
-                    "decode_request_us": 3.0,
-                    "decode_context_token_us": 0.5
                 }
             }
         })
@@ -670,7 +689,7 @@ mod tests {
         );
 
         let mut unordered_axis = profile_json();
-        unordered_axis["timing"]["grid"]["decode_reqs"] = json!([2, 0]);
+        unordered_axis["predictor"]["grid"]["decode_reqs"] = json!([2, 0]);
         assert!(
             parse(&unordered_axis)
                 .unwrap_err()
@@ -679,7 +698,7 @@ mod tests {
         );
 
         let mut missing_value = profile_json();
-        missing_value["timing"]["grid"]["step_duration_us"] = json!([1, 2]);
+        missing_value["predictor"]["grid"]["step_duration_us"] = json!([1, 2]);
         assert!(
             parse(&missing_value)
                 .unwrap_err()
@@ -692,14 +711,11 @@ mod tests {
     fn grid_returns_exact_points_and_deterministic_interpolation() {
         let profile = parse(&profile_json()).unwrap();
         let exact = profile
-            .estimate_step(
-                StepShape {
-                    decode_reqs: 2,
-                    sum_decode_ctx_tokens: 20,
-                    prefill_tokens_in_step: 10,
-                },
-                OutOfDomainPolicy::Strict,
-            )
+            .estimate_step(StepShape {
+                decode_reqs: 2,
+                sum_decode_ctx_tokens: 20,
+                prefill_tokens_in_step: 10,
+            })
             .unwrap();
         assert_eq!(
             exact,
@@ -710,56 +726,52 @@ mod tests {
         );
 
         let interpolated = profile
-            .estimate_step(
-                StepShape {
-                    decode_reqs: 1,
-                    sum_decode_ctx_tokens: 10,
-                    prefill_tokens_in_step: 5,
-                },
-                OutOfDomainPolicy::Strict,
-            )
+            .estimate_step(StepShape {
+                decode_reqs: 1,
+                sum_decode_ctx_tokens: 10,
+                prefill_tokens_in_step: 5,
+            })
             .unwrap();
         assert_eq!(interpolated.duration_us, 175);
         assert_eq!(interpolated.source, StepTimingSource::GridInterpolation);
     }
 
     #[test]
-    fn out_of_domain_shape_warns_and_falls_back_or_fails_strict() {
+    fn out_of_domain_shape_fails_with_coverage_details() {
         let profile = parse(&profile_json()).unwrap();
-        let shape = StepShape {
-            decode_reqs: 1,
-            sum_decode_ctx_tokens: 10,
-            prefill_tokens_in_step: 12,
-        };
-        let fallback = profile
-            .estimate_step(shape, OutOfDomainPolicy::WarnAndFallback)
-            .unwrap();
-        assert_eq!(
-            fallback,
-            StepTimingEstimate {
-                duration_us: 33,
-                source: StepTimingSource::ParametricFallback,
-            }
-        );
-
-        let error = profile
-            .estimate_step(shape, OutOfDomainPolicy::Strict)
-            .unwrap_err();
-        assert!(error.to_string().contains("does not cover step shape"));
+        for shape in [
+            StepShape {
+                decode_reqs: 3,
+                sum_decode_ctx_tokens: 10,
+                prefill_tokens_in_step: 2,
+            },
+            StepShape {
+                decode_reqs: 1,
+                sum_decode_ctx_tokens: 21,
+                prefill_tokens_in_step: 2,
+            },
+            StepShape {
+                decode_reqs: 1,
+                sum_decode_ctx_tokens: 10,
+                prefill_tokens_in_step: 12,
+            },
+        ] {
+            let error = profile.estimate_step(shape).unwrap_err().to_string();
+            assert!(error.contains("does not cover step shape"));
+            assert!(error.contains("supported predictor coverage"));
+            assert!(error.contains("calibration.manifest.json"));
+        }
     }
 
     #[test]
-    fn invalid_step_shapes_fail_before_fallback() {
+    fn invalid_step_shapes_fail_before_coverage() {
         let profile = parse(&profile_json()).unwrap();
         let no_work = profile
-            .estimate_step(
-                StepShape {
-                    decode_reqs: 0,
-                    sum_decode_ctx_tokens: 0,
-                    prefill_tokens_in_step: 0,
-                },
-                OutOfDomainPolicy::WarnAndFallback,
-            )
+            .estimate_step(StepShape {
+                decode_reqs: 0,
+                sum_decode_ctx_tokens: 0,
+                prefill_tokens_in_step: 0,
+            })
             .unwrap_err();
         assert!(
             no_work
@@ -768,26 +780,20 @@ mod tests {
         );
 
         let over_budget = profile
-            .estimate_step(
-                StepShape {
-                    decode_reqs: 4,
-                    sum_decode_ctx_tokens: 16,
-                    prefill_tokens_in_step: 13,
-                },
-                OutOfDomainPolicy::WarnAndFallback,
-            )
+            .estimate_step(StepShape {
+                decode_reqs: 4,
+                sum_decode_ctx_tokens: 16,
+                prefill_tokens_in_step: 13,
+            })
             .unwrap_err();
         assert!(over_budget.to_string().contains("exceeds scheduler"));
 
         let context_without_decode = profile
-            .estimate_step(
-                StepShape {
-                    decode_reqs: 0,
-                    sum_decode_ctx_tokens: 1,
-                    prefill_tokens_in_step: 1,
-                },
-                OutOfDomainPolicy::WarnAndFallback,
-            )
+            .estimate_step(StepShape {
+                decode_reqs: 0,
+                sum_decode_ctx_tokens: 1,
+                prefill_tokens_in_step: 1,
+            })
             .unwrap_err();
         assert!(
             context_without_decode
@@ -797,44 +803,28 @@ mod tests {
     }
 
     #[test]
-    fn zero_cost_profile_is_valid_and_fallback_overflow_is_rejected() {
+    fn zero_cost_profile_is_valid_and_out_of_domain_fails() {
         let mut zero_cost = profile_json();
-        zero_cost["timing"]["grid"]["step_duration_us"] = json!([0, 0, 0, 0, 0, 0, 0, 0]);
-        zero_cost["timing"]["fallback"] = json!({
-            "t0_us": 0.0,
-            "prefill_token_us": 0.0,
-            "decode_request_us": 0.0,
-            "decode_context_token_us": 0.0
-        });
+        zero_cost["predictor"]["grid"]["step_duration_us"] = json!([0, 0, 0, 0, 0, 0, 0, 0]);
         let profile = parse(&zero_cost).unwrap();
         assert_eq!(
             profile
-                .estimate_step(
-                    StepShape {
-                        decode_reqs: 1,
-                        sum_decode_ctx_tokens: 10,
-                        prefill_tokens_in_step: 12,
-                    },
-                    OutOfDomainPolicy::WarnAndFallback,
-                )
+                .estimate_step(StepShape {
+                    decode_reqs: 1,
+                    sum_decode_ctx_tokens: 10,
+                    prefill_tokens_in_step: 10,
+                },)
                 .unwrap()
                 .duration_us,
             0
         );
-
-        let mut overflow = profile_json();
-        overflow["timing"]["fallback"]["t0_us"] = json!(1.0e308);
-        let profile = parse(&overflow).unwrap();
         let error = profile
-            .estimate_step(
-                StepShape {
-                    decode_reqs: 1,
-                    sum_decode_ctx_tokens: 10,
-                    prefill_tokens_in_step: 12,
-                },
-                OutOfDomainPolicy::WarnAndFallback,
-            )
+            .estimate_step(StepShape {
+                decode_reqs: 1,
+                sum_decode_ctx_tokens: 10,
+                prefill_tokens_in_step: 11,
+            })
             .unwrap_err();
-        assert!(error.to_string().contains("fallback overflow"));
+        assert!(error.to_string().contains("supported predictor coverage"));
     }
 }

@@ -14,7 +14,12 @@
       "max_chunk_tokens": 2
     }
   },
-  "timing": {
+  "predictor": {
+    "coverage": {
+      "decode_reqs": [0, 2],
+      "sum_decode_ctx_tokens": [0, 4],
+      "prefill_tokens_in_step": [0, 4]
+    },
     "grid": {
       "decode_reqs": [0, 1, 2],
       "sum_decode_ctx_tokens": [0, 2, 4],
@@ -30,12 +35,6 @@
         110000, 210000, 310000,
         120000, 220000, 320000
       ]
-    },
-    "fallback": {
-      "t0_us": 10000.0,
-      "prefill_token_us": 10000.0,
-      "decode_request_us": 5000.0,
-      "decode_context_token_us": 1000.0
     }
   }
 }

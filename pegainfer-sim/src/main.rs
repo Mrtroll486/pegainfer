@@ -9,7 +9,6 @@ use clap::Parser;
 use pegainfer_sim::SimulatedEngineConfig;
 use pegainfer_sim::profile::EngineProfile;
 use pegainfer_sim::profile::LoadedEngineProfile;
-use pegainfer_sim::profile::OutOfDomainPolicy;
 use pegainfer_sim::start_engine;
 
 const DEFAULT_MODEL_ID: &str = "Qwen/Qwen3-0.6B";
@@ -64,11 +63,6 @@ struct Args {
     /// Versioned timing and scheduler profile generated from a target engine.
     #[arg(long, value_name = "FILE")]
     profile: Option<PathBuf>,
-
-    /// Reject step shapes outside the profile timing grid instead of using
-    /// the profile's parametric fallback.
-    #[arg(long)]
-    strict: bool,
 }
 
 #[derive(Debug)]
@@ -78,7 +72,6 @@ struct RuntimeConfig {
     served_model_name: Vec<String>,
     max_model_len: u32,
     profile: Option<LoadedEngineProfile>,
-    out_of_domain: Option<OutOfDomainPolicy>,
 }
 
 fn build_runtime(args: &Args) -> Result<RuntimeConfig> {
@@ -103,14 +96,9 @@ fn build_runtime(args: &Args) -> Result<RuntimeConfig> {
                 profile.scheduler.max_model_len
             );
         }
-        let out_of_domain = if args.strict {
-            OutOfDomainPolicy::Strict
-        } else {
-            OutOfDomainPolicy::WarnAndFallback
-        };
         let engine = SimulatedEngineConfig::default()
             .with_fallback_token_id(args.fallback_token_id)
-            .with_engine_profile(profile.clone(), out_of_domain)?;
+            .with_engine_profile(profile.clone())?;
         let model_path = args.model_path.clone().unwrap_or_else(|| {
             args.model_id
                 .as_deref()
@@ -122,14 +110,8 @@ fn build_runtime(args: &Args) -> Result<RuntimeConfig> {
             served_model_name: vec![model_id],
             max_model_len: profile.scheduler.max_model_len,
             profile: Some(profile),
-            out_of_domain: Some(out_of_domain),
         });
     }
-
-    ensure!(
-        !args.strict,
-        "--strict requires --profile; legacy timing has no profile domain to validate"
-    );
     let model_id = args
         .model_id
         .clone()
@@ -166,7 +148,6 @@ fn build_runtime(args: &Args) -> Result<RuntimeConfig> {
         },
         max_model_len,
         profile: None,
-        out_of_domain: None,
     })
 }
 
@@ -192,7 +173,7 @@ fn report_profile(runtime: &RuntimeConfig) {
     };
     let scheduler = &profile.scheduler;
     eprintln!(
-        "active engine profile: path={} manifest={} manifest_sha256={} target={} version={} model={} revision={} gpu={} scheduler={:?} max_num_seqs={} max_num_batched_tokens={} max_model_len={} timing_domain={:?} out_of_domain={:?}",
+        "active engine profile: path={} manifest={} manifest_sha256={} target={} version={} model={} revision={} gpu={} scheduler={:?} max_num_seqs={} max_num_batched_tokens={} max_model_len={} predictor_coverage={:?}",
         profile.profile_path.display(),
         profile.manifest_path.display(),
         profile.calibration.sha256,
@@ -205,8 +186,7 @@ fn report_profile(runtime: &RuntimeConfig) {
         scheduler.max_num_seqs,
         scheduler.max_num_batched_tokens,
         scheduler.max_model_len,
-        profile.timing.grid.domain(),
-        runtime.out_of_domain,
+        profile.predictor.coverage.domain(),
     );
 }
 
@@ -258,7 +238,6 @@ mod tests {
             tpot_ms: None,
             fallback_token_id: DEFAULT_FALLBACK_TOKEN_ID,
             profile: None,
-            strict: false,
         }
     }
 
@@ -267,7 +246,6 @@ mod tests {
         let runtime = build_runtime(&legacy_args()).expect("legacy runtime should build");
 
         assert!(runtime.profile.is_none());
-        assert!(runtime.out_of_domain.is_none());
     }
 
     #[test]
