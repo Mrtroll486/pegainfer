@@ -861,6 +861,7 @@ mod tests {
                 reason: FinishReason::Stop,
                 prompt_tokens: 2,
                 completion_tokens: 3,
+                ..
             }
         ));
     }
@@ -927,6 +928,7 @@ mod tests {
                 reason: FinishReason::Length,
                 prompt_tokens: 2,
                 completion_tokens: 3,
+                ..
             }
         ));
     }
