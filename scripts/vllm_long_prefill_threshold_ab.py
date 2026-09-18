@@ -44,9 +44,6 @@ from bench_http_common import (
 
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parent.parent
-DEFAULT_MODEL = Path("/home/mgj/qwen3weights/Qwen3-4B")
-DEFAULT_OUTPUT = REPO_ROOT / "docs/benchmarks/vllm-long-prefill-threshold-ab-3090.json"
-SERVED_MODEL = "Qwen3-4B-threshold-ab"
 
 
 @dataclass
@@ -140,6 +137,7 @@ def stop_server(process: subprocess.Popen[bytes]) -> None:
 def stream_completion(
     *,
     port: int,
+    served_model_name: str,
     label: str,
     request_id: str,
     prompt_token_ids: list[int],
@@ -162,7 +160,7 @@ def stream_completion(
     conn = http.client.HTTPConnection("127.0.0.1", port=port, timeout=timeout_s)
 
     body = {
-        "model": SERVED_MODEL,
+        "model": served_model_name,
         "prompt": prompt_token_ids,
         "add_special_tokens": False,
         "max_tokens": max_tokens,
@@ -312,7 +310,7 @@ def server_command(args: argparse.Namespace, threshold: int, port: int) -> list[
         "--port",
         str(port),
         "--served-model-name",
-        SERVED_MODEL,
+        args.served_model_name,
         "--dtype",
         "bfloat16",
         "--max-model-len",
@@ -380,6 +378,7 @@ def run_server_case(args: argparse.Namespace, run_index: int, threshold: int) ->
             startup_ms = wait_for_server(process, port, log_path, args.server_timeout)
             warmup = stream_completion(
                 port=port,
+                served_model_name=args.served_model_name,
                 label="warmup",
                 request_id=f"warmup-r{run_index}",
                 prompt_token_ids=[101] * 64,
@@ -396,6 +395,7 @@ def run_server_case(args: argparse.Namespace, run_index: int, threshold: int) ->
                 thread, holder, done = run_in_thread(
                     {
                         "port": port,
+                        "served_model_name": args.served_model_name,
                         "label": label,
                         "request_id": f"{label.lower()}-r{run_index}",
                         "prompt_token_ids": [301 + offset] * 16,
@@ -427,6 +427,7 @@ def run_server_case(args: argparse.Namespace, run_index: int, threshold: int) ->
                 c_thread, c_holder, c_done = run_in_thread(
                     {
                         "port": port,
+                        "served_model_name": args.served_model_name,
                         "label": "C",
                         "request_id": f"c-r{run_index}-t{trial_index}",
                         "prompt_token_ids": [401 + trial_index] * args.long_prompt_tokens,
@@ -441,6 +442,7 @@ def run_server_case(args: argparse.Namespace, run_index: int, threshold: int) ->
                 d_thread, d_holder, d_done = run_in_thread(
                     {
                         "port": port,
+                        "served_model_name": args.served_model_name,
                         "label": "D",
                         "request_id": f"d-r{run_index}-t{trial_index}",
                         "prompt_token_ids": [501 + trial_index] * args.short_prompt_tokens,
@@ -583,8 +585,9 @@ def summarize_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--served-model-name", required=True)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--threshold-order", type=parse_int_list, default=[0, 128, 128, 0])
     parser.add_argument("--repeats", type=int, default=3)
