@@ -746,4 +746,185 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn chunk_cap_changes_same_step_admission_without_changing_outputs() {
+        #[derive(Debug)]
+        struct ReplayStep {
+            id: u64,
+            shape: StepShape,
+            admitted: Vec<u32>,
+            prefill: Vec<(u32, u32)>,
+            running: usize,
+            waiting: usize,
+            finished: Vec<u32>,
+            generated: Vec<(u32, u32)>,
+        }
+
+        struct Replay {
+            steps: Vec<ReplayStep>,
+            finished: Vec<u32>,
+            generated: Vec<(u32, u32)>,
+        }
+
+        fn record_step(worker: &mut WorkerState<u32>) -> Option<ReplayStep> {
+            let (step_id, mut step) = {
+                let plan = worker.plan_step().unwrap()?;
+                (
+                    plan.id(),
+                    ReplayStep {
+                        id: plan.id().get(),
+                        shape: plan.shape(),
+                        admitted: plan.admitted().to_vec(),
+                        prefill: plan
+                            .prefill()
+                            .iter()
+                            .map(|work| (work.request_id, work.tokens))
+                            .collect(),
+                        running: worker.running_len(),
+                        waiting: worker.waiting_len(),
+                        finished: Vec::new(),
+                        generated: Vec::new(),
+                    },
+                )
+            };
+            let outcome = worker.complete_step(step_id).unwrap();
+            step.finished = outcome.finished;
+            step.generated = outcome
+                .generated
+                .into_iter()
+                .map(|token| (token.request_id, token.token_index))
+                .collect();
+            Some(step)
+        }
+
+        fn replay(max_chunk_tokens: u32) -> Replay {
+            let mut worker = WorkerState::new(scheduler(
+                4,
+                8,
+                128,
+                PrefillPolicy::Chunked { max_chunk_tokens },
+            ))
+            .unwrap();
+            assert_eq!(
+                worker.submit(request(1, 0, 3)).unwrap(),
+                SubmissionResult::Queued
+            );
+            assert_eq!(
+                worker.submit(request(2, 0, 3)).unwrap(),
+                SubmissionResult::Queued
+            );
+
+            let mut steps = vec![record_step(&mut worker).unwrap()];
+            assert_eq!(steps[0].shape.decode_reqs, 2);
+            assert_eq!(steps[0].generated.len(), 2);
+
+            assert_eq!(
+                worker.submit(request(3, 100, 2)).unwrap(),
+                SubmissionResult::Queued
+            );
+            assert_eq!(
+                worker.submit(request(4, 1, 1)).unwrap(),
+                SubmissionResult::Queued
+            );
+
+            for _ in 0..128 {
+                let Some(step) = record_step(&mut worker) else {
+                    break;
+                };
+                steps.push(step);
+            }
+            assert!(worker.is_idle());
+            let mut finished = steps
+                .iter()
+                .flat_map(|step| step.finished.iter().copied())
+                .collect::<Vec<_>>();
+            finished.sort_unstable();
+            let mut generated = steps
+                .iter()
+                .flat_map(|step| step.generated.iter().copied())
+                .collect::<Vec<_>>();
+            generated.sort_unstable();
+            Replay {
+                steps,
+                finished,
+                generated,
+            }
+        }
+
+        let cap_six = replay(6);
+        let cap_two = replay(2);
+
+        assert_eq!(
+            cap_six.steps[1].shape,
+            StepShape {
+                decode_reqs: 2,
+                sum_decode_ctx_tokens: 2,
+                prefill_tokens_in_step: 6,
+            }
+        );
+        assert_eq!(cap_six.steps[1].admitted, [3]);
+        assert_eq!(cap_six.steps[1].prefill, [(3, 6)]);
+        assert_eq!((cap_six.steps[1].running, cap_six.steps[1].waiting), (3, 1));
+
+        assert_eq!(
+            cap_two.steps[1].shape,
+            StepShape {
+                decode_reqs: 2,
+                sum_decode_ctx_tokens: 2,
+                prefill_tokens_in_step: 3,
+            }
+        );
+        assert_eq!(cap_two.steps[1].admitted, [3, 4]);
+        assert_eq!(cap_two.steps[1].prefill, [(3, 2), (4, 1)]);
+        assert_eq!((cap_two.steps[1].running, cap_two.steps[1].waiting), (4, 0));
+
+        let cap_six_d_admission = cap_six
+            .steps
+            .iter()
+            .find(|step| step.admitted.contains(&4))
+            .map(|step| step.id);
+        let cap_two_d_admission = cap_two
+            .steps
+            .iter()
+            .find(|step| step.admitted.contains(&4))
+            .map(|step| step.id);
+        assert_eq!(cap_six_d_admission, Some(3));
+        assert_eq!(cap_two_d_admission, Some(1));
+        assert_eq!(
+            cap_six
+                .steps
+                .iter()
+                .find(|step| step.finished.contains(&3))
+                .map(|step| step.id),
+            Some(18)
+        );
+        assert_eq!(
+            cap_two
+                .steps
+                .iter()
+                .find(|step| step.finished.contains(&3))
+                .map(|step| step.id),
+            Some(51)
+        );
+        assert_eq!(cap_six.finished, [1, 2, 3, 4]);
+        assert_eq!(cap_two.finished, [1, 2, 3, 4]);
+        assert_eq!(
+            cap_six.generated,
+            [
+                (1, 1),
+                (1, 2),
+                (1, 3),
+                (2, 1),
+                (2, 2),
+                (2, 3),
+                (3, 1),
+                (3, 2),
+                (4, 1),
+            ]
+        );
+        assert_eq!(cap_two.generated, cap_six.generated);
+        assert_eq!(cap_six.steps.len(), 19);
+        assert_eq!(cap_two.steps.len(), 52);
+    }
 }
