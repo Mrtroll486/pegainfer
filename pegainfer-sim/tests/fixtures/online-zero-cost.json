@@ -1,19 +1,8 @@
 {
   "schema_version": 1,
-  "profile_id": "online-zero-cost",
-  "provenance": {
-    "target_engine": "vllm",
-    "engine_version": "fixture",
-    "model_id": "pegainfer-sim-zero-cost",
-    "model_revision": "fixture-revision",
-    "model_config_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-    "gpu": "fixture-cpu",
-    "server_flags": [
-      "--max-num-seqs=2",
-      "--max-num-batched-tokens=4",
-      "--max-model-len=16",
-      "--enable-chunked-prefill"
-    ]
+  "calibration": {
+    "manifest": "online-zero-cost.manifest.json",
+    "sha256": "ff93f08f9f81855cea5b96c99cbad188ba708d99ca340aa6a9b05282c1123926"
   },
   "scheduler": {
     "policy": "vllm_v1",

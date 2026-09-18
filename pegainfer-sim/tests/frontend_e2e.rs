@@ -9,6 +9,7 @@ use anyhow::anyhow;
 use anyhow::bail;
 use pegainfer_sim::SimulatedEngineConfig;
 use pegainfer_sim::profile::EngineProfile;
+use pegainfer_sim::profile::LoadedEngineProfile;
 use pegainfer_sim::profile::OutOfDomainPolicy;
 use pegainfer_sim::profile::StepShape;
 use pegainfer_sim::start_engine;
@@ -202,16 +203,28 @@ struct PlanTrace {
     decode: Vec<(u64, u32)>,
 }
 
-fn profile_fixture(name: &str) -> Result<EngineProfile> {
-    let bytes: &[u8] = match name {
-        "online-step-gate.json" => include_bytes!("fixtures/online-step-gate.json"),
-        "online-zero-cost.json" => include_bytes!("fixtures/online-zero-cost.json"),
+fn profile_fixture(name: &str) -> Result<(TempDir, LoadedEngineProfile)> {
+    let (profile_bytes, manifest_name, manifest_bytes): (&[u8], &str, &[u8]) = match name {
+        "online-step-gate.json" => (
+            include_bytes!("fixtures/online-step-gate.json"),
+            "online-step-gate.manifest.json",
+            include_bytes!("fixtures/online-step-gate.manifest.json"),
+        ),
+        "online-zero-cost.json" => (
+            include_bytes!("fixtures/online-zero-cost.json"),
+            "online-zero-cost.manifest.json",
+            include_bytes!("fixtures/online-zero-cost.manifest.json"),
+        ),
         other => bail!("unknown profile fixture {other}"),
     };
-    EngineProfile::from_json_slice(bytes)
+    let dir = tempfile::tempdir()?;
+    fs::write(dir.path().join(name), profile_bytes)?;
+    fs::write(dir.path().join(manifest_name), manifest_bytes)?;
+    let profile = EngineProfile::load_from_path(dir.path().join(name))?;
+    Ok((dir, profile))
 }
 
-fn replay_profiled_worker(profile: &EngineProfile) -> Result<Vec<PlanTrace>> {
+fn replay_profiled_worker(profile: &LoadedEngineProfile) -> Result<Vec<PlanTrace>> {
     let mut worker = WorkerState::new(profile.scheduler.clone())?;
     for request in [
         WorkerRequest {
@@ -319,7 +332,7 @@ async fn simulated_engine_serves_openai_completions_over_http() -> Result<()> {
 
 #[test]
 fn profiled_worker_replay_is_deterministic_and_bounded() -> Result<()> {
-    let profile = profile_fixture("online-step-gate.json")?;
+    let (_fixture_dir, profile) = profile_fixture("online-step-gate.json")?;
     let first = replay_profiled_worker(&profile)?;
     let second = replay_profiled_worker(&profile)?;
 
@@ -356,7 +369,7 @@ fn profiled_worker_replay_is_deterministic_and_bounded() -> Result<()> {
 
 #[test]
 fn zero_cost_profile_fixture_is_valid() -> Result<()> {
-    let profile = profile_fixture("online-zero-cost.json")?;
+    let (_fixture_dir, profile) = profile_fixture("online-zero-cost.json")?;
     assert!(
         profile
             .timing
@@ -381,7 +394,7 @@ fn zero_cost_profile_fixture_is_valid() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn profiled_online_worker_serves_multi_request_workload() -> Result<()> {
-    let profile = profile_fixture("online-step-gate.json")?;
+    let (_fixture_dir, profile) = profile_fixture("online-step-gate.json")?;
     let config =
         SimulatedEngineConfig::default().with_engine_profile(profile, OutOfDomainPolicy::Strict)?;
     let server = SimServer::spawn_with_config(
@@ -471,7 +484,7 @@ async fn profiled_online_worker_serves_multi_request_workload() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zero_cost_profile_measures_frontend_baseline() -> Result<()> {
-    let profile = profile_fixture("online-zero-cost.json")?;
+    let (_fixture_dir, profile) = profile_fixture("online-zero-cost.json")?;
     let config =
         SimulatedEngineConfig::default().with_engine_profile(profile, OutOfDomainPolicy::Strict)?;
     let server = SimServer::spawn_with_config(

@@ -8,6 +8,7 @@ use anyhow::ensure;
 use clap::Parser;
 use pegainfer_sim::SimulatedEngineConfig;
 use pegainfer_sim::profile::EngineProfile;
+use pegainfer_sim::profile::LoadedEngineProfile;
 use pegainfer_sim::profile::OutOfDomainPolicy;
 use pegainfer_sim::start_engine;
 
@@ -76,24 +77,22 @@ struct RuntimeConfig {
     model_path: PathBuf,
     served_model_name: Vec<String>,
     max_model_len: u32,
-    profile: Option<EngineProfile>,
+    profile: Option<LoadedEngineProfile>,
     out_of_domain: Option<OutOfDomainPolicy>,
 }
 
 fn build_runtime(args: &Args) -> Result<RuntimeConfig> {
     if let Some(path) = &args.profile {
         ensure_legacy_timing_flags_are_absent(args)?;
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("failed to read engine profile {}", path.display()))?;
-        let profile = EngineProfile::from_json_slice(&bytes)
+        let profile = EngineProfile::load_from_path(path)
             .with_context(|| format!("failed to load engine profile {}", path.display()))?;
-        let model_id = profile.provenance.model_id.clone();
+        let model_id = profile.model_id().to_string();
         if let Some(requested) = &args.model_id {
             ensure!(
-                requested == &profile.provenance.model_id,
+                requested == profile.model_id(),
                 "--model-id '{}' conflicts with profile model_id '{}'",
                 requested,
-                profile.provenance.model_id
+                profile.model_id()
             );
         }
         if let Some(requested) = args.max_model_len {
@@ -193,13 +192,15 @@ fn report_profile(runtime: &RuntimeConfig) {
     };
     let scheduler = &profile.scheduler;
     eprintln!(
-        "active engine profile: id={} target={} version={} model={} revision={} gpu={} scheduler={:?} max_num_seqs={} max_num_batched_tokens={} max_model_len={} timing_domain={:?} out_of_domain={:?}",
-        profile.profile_id,
-        profile.provenance.target_engine,
-        profile.provenance.engine_version,
-        profile.provenance.model_id,
-        profile.provenance.model_revision,
-        profile.provenance.gpu,
+        "active engine profile: path={} manifest={} manifest_sha256={} target={} version={} model={} revision={} gpu={} scheduler={:?} max_num_seqs={} max_num_batched_tokens={} max_model_len={} timing_domain={:?} out_of_domain={:?}",
+        profile.profile_path.display(),
+        profile.manifest_path.display(),
+        profile.calibration.sha256,
+        profile.manifest.target_engine,
+        profile.manifest.engine_version,
+        profile.manifest.model_id,
+        profile.manifest.model_revision,
+        profile.manifest.gpu,
         scheduler.policy,
         scheduler.max_num_seqs,
         scheduler.max_num_batched_tokens,

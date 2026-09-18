@@ -1,4 +1,9 @@
 use std::fmt::Display;
+use std::fmt::Write as _;
+use std::fs;
+use std::ops::Deref;
+use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -6,6 +11,8 @@ use anyhow::bail;
 use anyhow::ensure;
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 
 pub const ENGINE_PROFILE_SCHEMA_VERSION: u32 = 1;
 
@@ -13,18 +20,67 @@ pub const ENGINE_PROFILE_SCHEMA_VERSION: u32 = 1;
 #[serde(deny_unknown_fields)]
 pub struct EngineProfile {
     pub schema_version: u32,
-    pub profile_id: String,
-    pub provenance: ProfileProvenance,
+    pub calibration: CalibrationReference,
     pub scheduler: SchedulerProfile,
     pub timing: StepTimingProfile,
 }
 
 impl EngineProfile {
     pub fn from_json_slice(bytes: &[u8]) -> Result<Self> {
-        let profile: Self =
+        let value: serde_json::Value =
             serde_json::from_slice(bytes).context("failed to parse engine profile JSON")?;
+        if value.get("profile_id").is_some() || value.get("provenance").is_some() {
+            bail!(
+                "legacy engine profile fields 'profile_id'/'provenance' are unsupported; migrate to schema_version {ENGINE_PROFILE_SCHEMA_VERSION} with a calibration manifest reference"
+            );
+        }
+        let profile: Self =
+            serde_json::from_value(value).context("failed to deserialize engine profile schema")?;
         profile.validate()?;
         Ok(profile)
+    }
+
+    /// Load a profile and its calibration manifest from one relocatable bundle.
+    /// The manifest digest is checked before the loaded profile is returned.
+    pub fn load_from_path(path: impl AsRef<Path>) -> Result<LoadedEngineProfile> {
+        let profile_path = path.as_ref().to_path_buf();
+        let profile_bytes = fs::read(&profile_path)
+            .with_context(|| format!("failed to read engine profile {}", profile_path.display()))?;
+        let profile = Self::from_json_slice(&profile_bytes)
+            .with_context(|| format!("failed to load engine profile {}", profile_path.display()))?;
+
+        let profile_dir = profile_path.parent().unwrap_or_else(|| Path::new("."));
+        let manifest_path = profile_dir.join(&profile.calibration.manifest);
+        let manifest_bytes = fs::read(&manifest_path).with_context(|| {
+            format!(
+                "failed to read calibration manifest {} referenced by {}",
+                manifest_path.display(),
+                profile_path.display()
+            )
+        })?;
+        let actual_sha256 = sha256_hex(&manifest_bytes);
+        ensure!(
+            actual_sha256.eq_ignore_ascii_case(&profile.calibration.sha256),
+            "calibration manifest digest mismatch for {}: profile references {}, actual {}",
+            manifest_path.display(),
+            profile.calibration.sha256,
+            actual_sha256
+        );
+        let manifest: CalibrationManifest =
+            serde_json::from_slice(&manifest_bytes).with_context(|| {
+                format!(
+                    "failed to parse calibration manifest {}",
+                    manifest_path.display()
+                )
+            })?;
+        manifest.validate()?;
+
+        Ok(LoadedEngineProfile {
+            profile,
+            manifest,
+            profile_path,
+            manifest_path,
+        })
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -34,8 +90,7 @@ impl EngineProfile {
             self.schema_version,
             ENGINE_PROFILE_SCHEMA_VERSION
         );
-        ensure_nonempty("profile_id", &self.profile_id)?;
-        self.provenance.validate()?;
+        self.calibration.validate()?;
         self.scheduler.validate()?;
         self.timing.validate(&self.scheduler)
     }
@@ -56,13 +111,15 @@ impl EngineProfile {
         let domain = self.timing.grid.domain();
         if out_of_domain == OutOfDomainPolicy::Strict {
             bail!(
-                "timing profile '{}' does not cover step shape {shape:?}; supported grid domain: {domain:?}",
-                self.profile_id
+                "calibration manifest '{}' (sha256 {}) does not cover step shape {shape:?}; supported grid domain: {domain:?}",
+                self.calibration.manifest,
+                self.calibration.sha256,
             );
         }
         log::warn!(
-            "timing profile '{}' does not cover step shape {shape:?}; using parametric fallback outside grid domain {domain:?}",
-            self.profile_id
+            "calibration manifest '{}' (sha256 {}) does not cover step shape {shape:?}; using parametric fallback outside grid domain {domain:?}",
+            self.calibration.manifest,
+            self.calibration.sha256,
         );
         Ok(StepTimingEstimate {
             duration_us: self.timing.fallback.evaluate(shape)?,
@@ -73,7 +130,29 @@ impl EngineProfile {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProfileProvenance {
+pub struct CalibrationReference {
+    pub manifest: String,
+    pub sha256: String,
+}
+
+impl CalibrationReference {
+    fn validate(&self) -> Result<()> {
+        ensure_nonempty("calibration.manifest", &self.manifest)?;
+        ensure!(
+            !Path::new(&self.manifest).is_absolute(),
+            "calibration.manifest must be a relative path"
+        );
+        ensure!(
+            is_sha256(&self.sha256),
+            "calibration.sha256 must be 64 hexadecimal characters"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CalibrationManifest {
     pub target_engine: String,
     pub engine_version: String,
     pub model_id: String,
@@ -81,23 +160,56 @@ pub struct ProfileProvenance {
     pub model_config_sha256: String,
     pub gpu: String,
     pub server_flags: Vec<String>,
+    pub collection_command: String,
+    pub source_artifacts: Vec<String>,
 }
 
-impl ProfileProvenance {
+impl CalibrationManifest {
     fn validate(&self) -> Result<()> {
-        ensure_nonempty("provenance.target_engine", &self.target_engine)?;
-        ensure_nonempty("provenance.engine_version", &self.engine_version)?;
-        ensure_nonempty("provenance.model_id", &self.model_id)?;
-        ensure_nonempty("provenance.model_revision", &self.model_revision)?;
-        ensure_nonempty("provenance.gpu", &self.gpu)?;
+        ensure_nonempty("manifest.target_engine", &self.target_engine)?;
+        ensure_nonempty("manifest.engine_version", &self.engine_version)?;
+        ensure_nonempty("manifest.model_id", &self.model_id)?;
+        ensure_nonempty("manifest.model_revision", &self.model_revision)?;
+        ensure_nonempty("manifest.gpu", &self.gpu)?;
         ensure!(
             is_sha256(&self.model_config_sha256),
-            "provenance.model_config_sha256 must be 64 hexadecimal characters"
+            "manifest.model_config_sha256 must be 64 hexadecimal characters"
         );
         for flag in &self.server_flags {
-            ensure_nonempty("provenance.server_flags entry", flag)?;
+            ensure_nonempty("manifest.server_flags entry", flag)?;
+        }
+        ensure_nonempty("manifest.collection_command", &self.collection_command)?;
+        for artifact in &self.source_artifacts {
+            ensure_nonempty("manifest.source_artifacts entry", artifact)?;
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadedEngineProfile {
+    pub profile: EngineProfile,
+    pub manifest: CalibrationManifest,
+    pub profile_path: PathBuf,
+    pub manifest_path: PathBuf,
+}
+
+impl LoadedEngineProfile {
+    pub fn validate(&self) -> Result<()> {
+        self.profile.validate()?;
+        self.manifest.validate()
+    }
+
+    pub fn model_id(&self) -> &str {
+        &self.manifest.model_id
+    }
+}
+
+impl Deref for LoadedEngineProfile {
+    type Target = EngineProfile;
+
+    fn deref(&self) -> &Self::Target {
+        &self.profile
     }
 }
 
@@ -469,6 +581,14 @@ fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
+}
+
 fn validate_axis<T>(name: &str, axis: &[T]) -> Result<()>
 where
     T: Copy + Ord + Display,
@@ -503,18 +623,9 @@ mod tests {
     fn profile_json() -> Value {
         json!({
             "schema_version": 1,
-            "profile_id": "vllm-test",
-            "provenance": {
-                "target_engine": "vllm",
-                "engine_version": "0.27.1",
-                "model_id": "Qwen/Qwen3-4B",
-                "model_revision": "test-revision",
-                "model_config_sha256": "00".repeat(32),
-                "gpu": "NVIDIA RTX 5090",
-                "server_flags": [
-                    "--max-num-batched-tokens=16",
-                    "--max-num-seqs=4"
-                ]
+            "calibration": {
+                "manifest": "calibration.manifest.json",
+                "sha256": "11".repeat(32)
             },
             "scheduler": {
                 "policy": "vllm_v1",

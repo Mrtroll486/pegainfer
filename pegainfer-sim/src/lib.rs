@@ -24,6 +24,7 @@ pub mod profile;
 pub mod worker;
 
 use profile::EngineProfile;
+use profile::LoadedEngineProfile;
 use profile::OutOfDomainPolicy;
 use worker::CancelResult;
 use worker::GeneratedToken;
@@ -57,7 +58,7 @@ pub struct SimulatedEngineConfig {
 
 #[derive(Clone, Debug)]
 struct ProfileConfig {
-    profile: EngineProfile,
+    profile: LoadedEngineProfile,
     out_of_domain: OutOfDomainPolicy,
 }
 
@@ -123,12 +124,11 @@ impl SimulatedEngineConfig {
         self
     }
 
-    /// Use a validated engine profile for online step timing and scheduling.
-    /// CLI loading belongs to the following commit; this entry point keeps
-    /// the profiled path injectable for the scheduler and focused tests.
+    /// Use a profile bundle whose calibration manifest has already been
+    /// validated for online step timing and scheduling.
     pub fn with_engine_profile(
         mut self,
-        profile: EngineProfile,
+        profile: LoadedEngineProfile,
         out_of_domain: OutOfDomainPolicy,
     ) -> Result<Self> {
         profile.validate()?;
@@ -234,7 +234,7 @@ impl ProfiledRuntime {
         let worker = WorkerState::new(config.profile.scheduler.clone())
             .expect("profile was validated before scheduler construction");
         Self {
-            profile: config.profile.clone(),
+            profile: config.profile.profile.clone(),
             out_of_domain: config.out_of_domain,
             worker,
             requests: HashMap::new(),
@@ -715,10 +715,11 @@ mod tests {
     use pegainfer_frontend::sampler::SamplingParams;
 
     use super::*;
+    use crate::profile::CalibrationManifest;
+    use crate::profile::CalibrationReference;
     use crate::profile::ENGINE_PROFILE_SCHEMA_VERSION;
     use crate::profile::ParametricFallback;
     use crate::profile::PrefillPolicy;
-    use crate::profile::ProfileProvenance;
     use crate::profile::SchedulerPolicy;
     use crate::profile::SchedulerProfile;
     use crate::profile::StepTimingProfile;
@@ -768,11 +769,37 @@ mod tests {
         (tokens, prompt_tokens, terminal.expect("terminal"))
     }
 
-    fn zero_cost_profile() -> EngineProfile {
-        EngineProfile {
-            schema_version: ENGINE_PROFILE_SCHEMA_VERSION,
-            profile_id: "online-test".to_string(),
-            provenance: ProfileProvenance {
+    fn zero_cost_profile() -> LoadedEngineProfile {
+        LoadedEngineProfile {
+            profile: EngineProfile {
+                schema_version: ENGINE_PROFILE_SCHEMA_VERSION,
+                calibration: CalibrationReference {
+                    manifest: "calibration.manifest.json".to_string(),
+                    sha256: "00".repeat(32),
+                },
+                scheduler: SchedulerProfile {
+                    policy: SchedulerPolicy::VllmV1,
+                    max_num_seqs: 2,
+                    max_num_batched_tokens: 4,
+                    max_model_len: 32,
+                    prefill: PrefillPolicy::Whole,
+                },
+                timing: StepTimingProfile {
+                    grid: TimingGrid {
+                        decode_reqs: vec![0, 2],
+                        sum_decode_ctx_tokens: vec![0, 8],
+                        prefill_tokens_in_step: vec![0, 4],
+                        step_duration_us: vec![0; 8],
+                    },
+                    fallback: ParametricFallback {
+                        t0_us: 0.0,
+                        prefill_token_us: 0.0,
+                        decode_request_us: 0.0,
+                        decode_context_token_us: 0.0,
+                    },
+                },
+            },
+            manifest: CalibrationManifest {
                 target_engine: "test-engine".to_string(),
                 engine_version: "0.0.0".to_string(),
                 model_id: "test-model".to_string(),
@@ -780,28 +807,11 @@ mod tests {
                 model_config_sha256: "00".repeat(32),
                 gpu: "test-gpu".to_string(),
                 server_flags: Vec::new(),
+                collection_command: "test".to_string(),
+                source_artifacts: Vec::new(),
             },
-            scheduler: SchedulerProfile {
-                policy: SchedulerPolicy::VllmV1,
-                max_num_seqs: 2,
-                max_num_batched_tokens: 4,
-                max_model_len: 32,
-                prefill: PrefillPolicy::Whole,
-            },
-            timing: StepTimingProfile {
-                grid: TimingGrid {
-                    decode_reqs: vec![0, 2],
-                    sum_decode_ctx_tokens: vec![0, 8],
-                    prefill_tokens_in_step: vec![0, 4],
-                    step_duration_us: vec![0; 8],
-                },
-                fallback: ParametricFallback {
-                    t0_us: 0.0,
-                    prefill_token_us: 0.0,
-                    decode_request_us: 0.0,
-                    decode_context_token_us: 0.0,
-                },
-            },
+            profile_path: "profile.json".into(),
+            manifest_path: "calibration.manifest.json".into(),
         }
     }
 
