@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Measure vLLM long-prefill threshold effects under live decode load.
+"""Run a focused vLLM field-ablation experiment under live decode load.
 
-The harness starts one vLLM server per threshold configuration. Each run:
+The experiment starts one vLLM server per threshold configuration. Each run:
 
 1. warms the model;
 2. starts two long-lived decode requests (A and B);
 3. submits a long prompt C followed immediately by a short prompt D;
 4. records streamed token IDs, TTFT, completion latency, and server metadata.
 
-Use an ABBA threshold order to reduce startup/thermal ordering bias. The script
-does not interpret wall-clock timings as scheduler traces; it reports them as
-HTTP observations and keeps output-token equality as a separate result.
+Use an ABBA threshold order to reduce startup/thermal ordering bias. This is a
+focused, single-engine experiment rather than a general benchmark framework.
+The script does not interpret wall-clock timings as scheduler traces; it reports
+them as HTTP observations and keeps output-token equality as a separate result.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import http.client
 import importlib.metadata
 import json
 import os
+import re
 import signal
 import socket
 import statistics
@@ -44,6 +46,10 @@ from bench_http_common import (
 
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parent.parent
+PRIVATE_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_~.-])/(?:home|root|tmp|mnt|workspace)(?:/[^\s\"'<>`]+)+"
+)
+PRIVATE_PATH_MARKERS = ("/home/", "/root/", "/tmp/", "/mnt/", "/workspace/")
 
 
 @dataclass
@@ -84,7 +90,36 @@ def display_path(path: Path) -> str:
     try:
         return str(path.resolve().relative_to(REPO_ROOT))
     except ValueError:
-        return str(path)
+        return f"<external>/{path.name}"
+
+
+def redact_text(value: str) -> str:
+    """Remove host-local paths before a value is retained in an artifact."""
+    redacted = value.replace(str(REPO_ROOT), "<repo>")
+    home = str(Path.home())
+    if home != "/":
+        redacted = redacted.replace(home, "<redacted>")
+    return PRIVATE_PATH_RE.sub("<redacted>", redacted)
+
+
+def redact_artifact(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_text(value)
+    if isinstance(value, list):
+        return [redact_artifact(item) for item in value]
+    if isinstance(value, dict):
+        return {key: redact_artifact(item) for key, item in value.items()}
+    return value
+
+
+def write_artifact(path: Path, document: Any) -> str:
+    """Serialize only the path-redacted view and fail closed on a path leak."""
+    sanitized = redact_artifact(document)
+    rendered = json.dumps(sanitized, sort_keys=True)
+    leaked = [marker for marker in PRIVATE_PATH_MARKERS if marker in rendered]
+    if leaked:
+        raise RuntimeError(f"artifact contains private path marker(s): {leaked}")
+    return write_json(path, sanitized)
 
 
 def tail_text(path: Path, max_bytes: int = 12_000) -> str:
@@ -95,7 +130,48 @@ def tail_text(path: Path, max_bytes: int = 12_000) -> str:
             handle.seek(max(0, size - max_bytes))
             return handle.read().decode("utf-8", errors="replace")
     except OSError as exc:
-        return f"failed to read log: {exc}"
+        return redact_text(f"failed to read log: {exc}")
+
+
+def validate_completion(
+    *,
+    output_token_ids: list[int],
+    finish_reason: str | None,
+    usage: dict[str, Any] | None,
+    prompt_tokens: int,
+    expected_output_tokens: int,
+    ignore_eos: bool,
+) -> None:
+    """Validate the evidence required for a comparable streamed sample."""
+    if not output_token_ids:
+        raise ValueError("completion had no output token IDs")
+    if len(output_token_ids) != expected_output_tokens:
+        raise ValueError(
+            "completion output token count mismatch: "
+            f"expected {expected_output_tokens}, got {len(output_token_ids)}"
+        )
+    if finish_reason is None:
+        raise ValueError("completion did not include a terminal finish reason")
+    if ignore_eos and finish_reason != "length":
+        raise ValueError(
+            "completion finish reason is incompatible with ignore_eos=true: "
+            f"{finish_reason!r}"
+        )
+    if usage is None:
+        return
+    expected_usage = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": expected_output_tokens,
+        "total_tokens": prompt_tokens + expected_output_tokens,
+    }
+    for field, expected in expected_usage.items():
+        actual = usage.get(field)
+        if isinstance(actual, bool) or not isinstance(actual, int):
+            raise ValueError(f"usage.{field} is missing or not an integer")
+        if actual != expected:
+            raise ValueError(
+                f"usage.{field} mismatch: expected {expected}, got {actual}"
+            )
 
 
 def wait_for_server(process: subprocess.Popen[bytes], port: int, log_path: Path, timeout_s: float) -> float:
@@ -216,18 +292,27 @@ def stream_completion(
             choice = choices[0]
             token_ids = choice.get("token_ids") or []
             text = choice.get("text") or ""
-            if token_ids or text:
+            if token_ids:
                 if first_token_perf is None:
                     first_token_perf = time.perf_counter()
                     first_token_wall = time.time()
                     if first_token_event is not None:
                         first_token_event.set()
                 output_token_ids.extend(int(token) for token in token_ids)
+            if text:
                 output_text.append(text)
             if choice.get("finish_reason") is not None:
                 finish_reason = str(choice["finish_reason"])
 
         ended = time.perf_counter()
+        validate_completion(
+            output_token_ids=output_token_ids,
+            finish_reason=finish_reason,
+            usage=usage,
+            prompt_tokens=len(prompt_token_ids),
+            expected_output_tokens=max_tokens,
+            ignore_eos=bool(body["ignore_eos"]),
+        )
         return RequestMeasurement(
             label=label,
             request_id=request_id,
@@ -260,7 +345,7 @@ def stream_completion(
             max_tokens=max_tokens,
             ok=False,
             status=status,
-            error=f"{type(exc).__name__}: {exc}",
+            error=redact_text(f"{type(exc).__name__}: {exc}"),
             start_wall_s=started_wall,
             first_token_wall_s=first_token_wall,
             end_wall_s=time.time(),
@@ -456,10 +541,6 @@ def run_server_case(args: argparse.Namespace, run_index: int, threshold: int) ->
                     raise TimeoutError(f"C/D trial {trial_index} did not complete")
                 c_result = c_holder[0]
                 d_result = d_holder[0]
-                if not c_result.ok or not d_result.ok:
-                    raise RuntimeError(
-                        f"C/D trial {trial_index} failed: C={c_result.error}, D={d_result.error}"
-                    )
                 trials.append(
                     {
                         "trial_index": trial_index,
@@ -493,7 +574,14 @@ def run_server_case(args: argparse.Namespace, run_index: int, threshold: int) ->
                 "run_index": run_index,
                 "threshold": threshold,
                 "port": port,
-                "server_command": shell_command(command),
+                "server_command": shell_command(
+                    [
+                        Path(command[0]).name,
+                        command[1],
+                        f"<external>/{args.model.name}",
+                        *command[3:],
+                    ]
+                ),
                 "server_log": display_path(log_path),
                 "startup_ms": startup_ms,
                 "warmup": asdict(warmup),
@@ -517,25 +605,58 @@ def summarize_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
     for threshold in thresholds:
         selected = [run for run in runs if int(run["threshold"]) == threshold]
         trials = [trial for run in selected for trial in run["trials"]]
+        valid_trials = [
+            trial
+            for trial in trials
+            if trial["c"]["ok"] and trial["d"]["ok"]
+        ]
+        invalid_samples = len(trials) - len(valid_trials)
+        background_active = all(
+            item["still_running_after_probes"]
+            for run in selected
+            for item in run["background"]
+        )
+        background_result_failures = sum(
+            int(
+                item["completed_result"] is not None
+                and not item["completed_result"]["ok"]
+            )
+            for run in selected
+            for item in run["background"]
+        )
         by_threshold[str(threshold)] = {
             "server_runs": len(selected),
+            "attempted_samples": len(trials),
+            "valid_samples": len(valid_trials),
+            "invalid_samples": invalid_samples,
             "trial_samples": len(trials),
-            "c_ttft_ms_median": median([trial["c"]["ttft_ms"] for trial in trials]),
-            "d_ttft_ms_median": median([trial["d"]["ttft_ms"] for trial in trials]),
-            "c_latency_ms_median": median([trial["c"]["latency_ms"] for trial in trials]),
-            "d_latency_ms_median": median([trial["d"]["latency_ms"] for trial in trials]),
+            "c_ttft_ms_median": median(
+                [trial["c"]["ttft_ms"] for trial in valid_trials]
+            ),
+            "d_ttft_ms_median": median(
+                [trial["d"]["ttft_ms"] for trial in valid_trials]
+            ),
+            "c_latency_ms_median": median(
+                [trial["c"]["latency_ms"] for trial in valid_trials]
+            ),
+            "d_latency_ms_median": median(
+                [trial["d"]["latency_ms"] for trial in valid_trials]
+            ),
             "d_first_token_after_c_ms_median": median(
-                [trial["d_first_token_after_c_ms"] for trial in trials]
+                [trial["d_first_token_after_c_ms"] for trial in valid_trials]
             ),
-            "all_background_requests_active": all(
-                item["still_running_after_probes"]
-                for run in selected
-                for item in run["background"]
-            ),
+            "all_background_requests_active": background_active,
+            "background_result_failures": background_result_failures,
             "request_failures": sum(
                 int(not trial[label]["ok"])
                 for trial in trials
                 for label in ("c", "d")
+            ),
+            "success": (
+                bool(trials)
+                and invalid_samples == 0
+                and background_active
+                and background_result_failures == 0
             ),
         }
 
@@ -549,12 +670,16 @@ def summarize_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
                 tuple(trial[label]["output_token_ids"])
                 for run in runs
                 for trial in run["trials"]
-                if int(trial["trial_index"]) == trial_index
+                if (
+                    int(trial["trial_index"]) == trial_index
+                    and trial["c"]["ok"]
+                    and trial["d"]["ok"]
+                )
             ]
             per_trial[str(trial_index)] = {
                 "samples": len(outputs),
                 "unique_outputs": len(set(outputs)),
-                "all_equal": len(set(outputs)) == 1,
+                "all_equal": bool(outputs) and len(set(outputs)) == 1,
                 "token_ids": list(outputs[0]) if outputs else [],
             }
         output_checks[label] = per_trial
@@ -577,6 +702,9 @@ def summarize_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
                 )
 
     return {
+        "success": bool(by_threshold) and all(
+            bool(item["success"]) for item in by_threshold.values()
+        ),
         "by_threshold": by_threshold,
         "output_token_equality": output_checks,
         "comparison_to_threshold_0": comparison,
@@ -653,20 +781,20 @@ def main() -> int:
         "script_sha256": sha256_file(SCRIPT_PATH),
         "environment": {
             "python": sys.version,
-            "python_executable": sys.executable,
+            "python_executable": Path(sys.executable).name,
             "vllm_version": importlib.metadata.version("vllm"),
-            "vllm_scheduler_source": str(scheduler_source),
+            "vllm_scheduler_source": "v1/core/sched/scheduler.py",
             "vllm_scheduler_source_sha256": sha256_file(scheduler_source),
             "hardware": detect_hardware_toolchain(),
             "selected_gpu": args.gpu,
             "python_include_dir": (
                 None
                 if args.python_include_dir is None
-                else str(args.python_include_dir)
+                else "<redacted>"
             ),
         },
         "model": {
-            "path": str(args.model),
+            "path": f"<external>/{args.model.name}",
             "fingerprint": model_fingerprint(str(args.model)),
         },
         "workload": {
@@ -695,21 +823,23 @@ def main() -> int:
             run = run_server_case(args, run_index, threshold)
             document["runs"].append(run)
             document["partial"] = True
-            write_json(args.output, document)
+            write_artifact(args.output, document)
         document["summary"] = summarize_runs(document["runs"])
         document["partial"] = False
+        document["success"] = document["summary"]["success"]
         document["finished_at_unix_s"] = time.time()
-        write_json(args.output, document)
+        write_artifact(args.output, document)
     except Exception as exc:  # noqa: BLE001 - preserve partial evidence before failing.
         document["partial"] = True
-        document["error"] = f"{type(exc).__name__}: {exc}"
+        document["success"] = False
+        document["error"] = redact_text(f"{type(exc).__name__}: {exc}")
         document["finished_at_unix_s"] = time.time()
-        write_json(args.output, document)
+        write_artifact(args.output, document)
         raise
 
     print(json.dumps(document["summary"], indent=2, sort_keys=True))
     print(f"result: {args.output}")
-    return 0
+    return 0 if document["success"] else 1
 
 
 if __name__ == "__main__":
